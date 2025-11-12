@@ -55,14 +55,14 @@ class BatchedMatmul(Operator):
     #     return self.latency
 
     def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
-        # ²ßÂÔ1£º½«ÅúÁ¿¾ØÕó³Ë·¨·Ö½âÎª¶à¸ö¶ÀÁ¢µÄ¾ØÕó³Ë·¨
+        # ç­–ç•¥1ï¼šå°†æ‰¹é‡çŸ©é˜µä¹˜æ³•åˆ†è§£ä¸ºå¤šä¸ªç‹¬ç«‹çš„çŸ©é˜µä¹˜æ³•
         matmul = Matmul(self.data_type)
         _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
         matmul_latency1 = (
             matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
         )
 
-        # ²ßÂÔ2£º½«ÅúÁ¿¾ØÕó³Ë·¨×÷ÎªÒ»¸öÕûÌå½øĞĞ´¦Àí test git
+        # ç­–ç•¥2ï¼šå°†æ‰¹é‡çŸ©é˜µä¹˜æ³•ä½œä¸ºä¸€ä¸ªæ•´ä½“è¿›è¡Œå¤„ç† test git
         matmul = Matmul(self.data_type)
         _ = matmul(
             Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
@@ -75,7 +75,7 @@ class BatchedMatmul(Operator):
             * self.data_type.word_size
             / pcb_module.io_module.bandwidth
         )
-        # Ñ¡ÔñÁ½ÖÖ²ßÂÔÖĞlatency½ÏĞ¡µÄ×÷Îª×îÖÕ½á¹û
+        # é€‰æ‹©ä¸¤ç§ç­–ç•¥ä¸­latencyè¾ƒå°çš„ä½œä¸ºæœ€ç»ˆç»“æœ
         self.latency = min(matmul_latency1, matmul_latency2)
         return self.latency
 
@@ -264,7 +264,7 @@ class Matmul(Operator):
 
     @staticmethod
     def find_permutations(n):
-        permutations = set() #set¼¯ºÏ£¬ÓÃÓÚ´æ´¢ËùÓĞ¿ÉÄÜµÄÅÅÁĞ×éºÏ£¬¼¯ºÏ²»ÔÊĞíÖØ¸´£¬ÔªËØÊÇÎŞĞòµÄ
+        permutations = set() #seté›†åˆï¼Œç”¨äºå­˜å‚¨æ‰€æœ‰å¯èƒ½çš„æ’åˆ—ç»„åˆï¼Œé›†åˆä¸å…è®¸é‡å¤ï¼Œå…ƒç´ æ˜¯æ— åºçš„
 
         for i in range(1, n + 1):
             if n % i == 0:
@@ -273,7 +273,7 @@ class Matmul(Operator):
                         k = n // (i * j)
                         permutations.add((i, j, k))
 
-        return list(permutations) #½«¼¯ºÏ×ª»»ÎªÁĞ±í£¬·µ»ØËùÓĞ¿ÉÄÜµÄÅÅÁĞ×éºÏ
+        return list(permutations) #å°†é›†åˆè½¬æ¢ä¸ºåˆ—è¡¨ï¼Œè¿”å›æ‰€æœ‰å¯èƒ½çš„æ’åˆ—ç»„åˆ
 
     def compile_and_simulate(
         self,
@@ -386,7 +386,7 @@ class Matmul(Operator):
                                                     l0_N_tiling_factor,
                                                     l0_K_tiling_factor,
                                                 )
-                                                cycle_count = self.simulate( #ºËĞÄÔÚÕâÀï£¬µ÷ÓÃsimulateº¯Êı½øĞĞÄ£Äâ
+                                                cycle_count = self.simulate( #æ ¸å¿ƒåœ¨è¿™é‡Œï¼Œè°ƒç”¨simulateå‡½æ•°è¿›è¡Œæ¨¡æ‹Ÿ
                                                     self.computational_graph,
                                                     mapping,
                                                     pcb_module,
@@ -809,7 +809,7 @@ class Matmul(Operator):
         N_remain = N % l2_tile_N
         K_remain = K % l2_tile_K
 
-        l2_tiles = np.empty( #´´½¨Ò»¸öÈıÎ¬Êı×é£¬ÓÃÓÚ´æ´¢L2 tileµÄÄ£Äâ½á¹û£¬ÀàĞÍÊÇL2TileSimulator
+        l2_tiles = np.empty( #åˆ›å»ºä¸€ä¸ªä¸‰ç»´æ•°ç»„ï¼Œç”¨äºå­˜å‚¨L2 tileçš„æ¨¡æ‹Ÿç»“æœï¼Œç±»å‹æ˜¯L2TileSimulator
             [ceil(M / l2_tile_M), ceil(N / l2_tile_N), ceil(K / l2_tile_K)],
             dtype=self.L2TileSimulator,
         )
@@ -928,7 +928,7 @@ class Matmul(Operator):
                 )
             
             if k > 0 and not (m == previous_m and n == previous_n):
-                current_tile_read_cycle_count += l2_tile.M_N_io_cycle_count #¶ÁÈ¡Ò»¸öĞÂµÄC¾ØÕóÖĞµÄM*N¾ØÕó
+                current_tile_read_cycle_count += l2_tile.M_N_io_cycle_count #è¯»å–ä¸€ä¸ªæ–°çš„CçŸ©é˜µä¸­çš„M*NçŸ©é˜µ
             
             # previous tile compute latency
             previous_tile_compute_cycle_count = previous_l2_tile.compute_cycle_count
@@ -938,7 +938,7 @@ class Matmul(Operator):
                 )
             # previous tile write latency
             if m == previous_m and n == previous_n:
-                previous_tile_write_cycle_count = 0 #²»ĞèÒªĞ´»ØL2
+                previous_tile_write_cycle_count = 0 #ä¸éœ€è¦å†™å›L2
             else:
                 previous_tile_write_cycle_count = previous_l2_tile.M_N_io_cycle_count
 
@@ -1010,11 +1010,11 @@ class Matmul(Operator):
             self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
                 M, N, K, data_type, mapping, pcb_module, look_up_table
             )
-#TODO£ºĞŞ¸Ä³É´ÓÖ÷´æÖĞ¶ÁÈ¡Êı¾İµ½Æ¬ÉÏÄÚ´æµÄÖÜÆÚÊı£¨ºÃÏñ²»Ì«¶Ô£¬½ü´æËãÁ¦Ó¦¸ÃÊÇÊı¾İÖ±½Ó´æcoreÉÏµÄÄÚ´æÖĞ£©
+#TODOï¼šä¿®æ”¹æˆä»ä¸»å­˜ä¸­è¯»å–æ•°æ®åˆ°ç‰‡ä¸Šå†…å­˜çš„å‘¨æœŸæ•°ï¼ˆå¥½åƒä¸å¤ªå¯¹ï¼Œè¿‘å­˜ç®—åŠ›åº”è¯¥æ˜¯æ•°æ®ç›´æ¥å­˜coreä¸Šçš„å†…å­˜ä¸­ï¼‰
         def simulate_l2_tile_io_cycle_count(
             self, M: int, N: int, data_type: DataType, chiplet_module: Device
         ):
-            return ceil(    #ÏòÉÏÈ¡Õû
+            return ceil(    #å‘ä¸Šå–æ•´
                 M
                 * N
                 * data_type.word_size
@@ -1234,7 +1234,7 @@ class Matmul(Operator):
                 # if one output tile in this batch shares input/output with another output tile in the previous batch, assign them to the same core to avoid data movement
                 # note that of the three input matrix mk, kn, mn, at most one of them can be the same if we change m,n,k
                 current_batch_M_K_read_count = np.sum(
-                    (current_batch_Read_M_K * (~previous_batch_Read_M_K)) #²¼¶û¾ØÕóÏà³Ë£¬ÊÇ°´Î»Óë£¬ÔÙÓëM_K_tile_sizeÏà³ËµÃµ½µ±Ç°batchĞèÒª¶ÁÈ¡µÄM_K_tile_sizeµÄ×Ü´óĞ¡
+                    (current_batch_Read_M_K * (~previous_batch_Read_M_K)) #å¸ƒå°”çŸ©é˜µç›¸ä¹˜ï¼Œæ˜¯æŒ‰ä½ä¸ï¼Œå†ä¸M_K_tile_sizeç›¸ä¹˜å¾—åˆ°å½“å‰batchéœ€è¦è¯»å–çš„M_K_tile_sizeçš„æ€»å¤§å°
                     * M_K_tile_size
                 )
                 current_batch_K_N_read_count = np.sum(
@@ -1253,7 +1253,7 @@ class Matmul(Operator):
                     * M_N_tile_size
                 )
 
-                # read current batch while compute and write previous batch Á÷Ë®Ïß´¦Àí
+                # read current batch while compute and write previous batch æµæ°´çº¿å¤„ç†
                 current_batch_read_count = (
                     current_batch_M_K_read_count
                     + current_batch_K_N_read_count
@@ -1485,7 +1485,7 @@ class Matmul(Operator):
         self,
     ):
         # import subprocess
-        # subprocess.run(['nvidia-smi', '-q', 'â€“d', 'CLOCK'])
+        # subprocess.run(['nvidia-smi', '-q', 'éˆ¥æ¹', 'CLOCK'])
         input1 = torch.randn(
             self.computational_graph.M,
             self.computational_graph.K,
