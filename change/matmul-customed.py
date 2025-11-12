@@ -62,7 +62,7 @@ class BatchedMatmul(Operator):
             matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
         )
 
-        # 策略2：将批量矩阵乘法作为一个整体进行处理
+        # 策略2：将批量矩阵乘法作为一个整体进行处理 test git
         matmul = Matmul(self.data_type)
         _ = matmul(
             Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
