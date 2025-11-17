@@ -1,7 +1,8 @@
 {
-    "name": "NVIDIA A100(80GB)x4",
+    "name": "3D Stack TEST",
     "device_count": 4,
-    "interconnect": {
+    "interconnect": {  
+        "TODO":"可能需要添加NoC的相关配置参数",
         "link": {
             "name": "NVLink3",
             "bandwidth_per_direction_byte": 25e9,
@@ -18,8 +19,10 @@
         "frequency_Hz": 1410e6,
         "compute_chiplet_count": 1,
         "compute_chiplet": {
-            "physical_core_count": 128,
-            "core_count": 108,
+            "physical_core_count": 9,  
+            "core_count": 8,
+            "_commet_core":"需要注意暂时选择channel数和core数保持一致，1core-1channel",
+            
             "process_node": "7nm",
             "core": {
                 "sublane_count": 4,
@@ -57,13 +60,21 @@
         ],
         "io": {
             "process_node": "7nm",
-            "global_buffer_MB": 40,
-            "physical_global_buffer_MB": 48,
-            "global_buffer_bandwidth_per_cycle_byte": 5120,
-            "memory_channel_physical_count": 6,
-            "memory_channel_active_count": 5,
+
+            "global_buffer_MB": 0,
+            "physical_global_buffer_MB": 0,
+            "global_buffer_bandwidth_per_cycle_byte": 0,
+            "_commet_global_buffer":"令L2缓存不存在来起到直接对接HBM和core的效果",
+
+            "memory_channel_physical_count": 9,
+            "memory_channel_active_count": 8,
+
+            "bandwidth_per_channel_byte":40e9, 
+            "_commet_bandwidth_of_HBM <-> core":"假设每个channel带宽为40GB/s",
+
             "pin_count_per_channel": 1024,
-            "bandwidth_per_pin_bit": 3.2e9
+            "bandwidth_per_pin_bit": 3.2e9,
+            "_commet_of_pin":"暂时不清楚pin部分是否需要做修改，先行保留"
         },
         "memory": {
             "total_capacity_GB": 80

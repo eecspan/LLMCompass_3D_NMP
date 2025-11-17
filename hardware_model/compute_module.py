@@ -123,6 +123,7 @@ class ComputeModule:
         clock_freq,
         l2_size,
         l2_bandwidth_per_cycle,
+        channel_bandwidth_per_cycle,
         overhead: Overhead = overhead_dict["A100"],
     ):
         self.core = core
@@ -130,6 +131,7 @@ class ComputeModule:
         self.clock_freq = clock_freq
         self.l2_size = int(l2_size)  # Byte
         self.l2_bandwidth_per_cycle = l2_bandwidth_per_cycle  # Byte/clock
+        self.channel_bandwidth_per_cycle = channel_bandwidth_per_cycle #Byte/clock
         self.total_vector_flops_per_cycle = (
             core.vector_unit.total_vector_flops_per_cycle * core_count
         )

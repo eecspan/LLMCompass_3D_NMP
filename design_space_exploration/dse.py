@@ -65,6 +65,7 @@ def template_to_system(arch_specs):
         device_specs["frequency_Hz"],
         io_specs["global_buffer_MB"] * 1024 * 1024,
         io_specs["global_buffer_bandwidth_per_cycle_byte"],
+        io_specs["bandwidth_per_channel_byte"],
         overhead_dict["A100"],
     )
     # io module

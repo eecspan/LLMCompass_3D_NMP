@@ -69,7 +69,7 @@ class TransformerBlockInitComputationTP(Operator):
         d_h = d // h
 
         # multi-head attention
-        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt] 这一步导入了wq权重矩阵，借用matmul的call函数利用wq和输入矩阵X生成computational_graph，为后续的compile-and-simulate提供矩阵大小信息支持
+        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt] 杩欎竴姝ュ鍏ヤ簡wq鏉冮噸鐭╅樀锛屽�熺敤matmul鐨刢all鍑芥暟鍒╃敤wq鍜岃緭鍏ョ煩闃礨鐢熸垚computational_graph锛屼负鍚庣画鐨刢ompile-and-simulate鎻愪緵鐭╅樀澶у皬淇℃伅鏀寔
         assert Q.shape == [b, s, d // dev_cnt]
         K = self.K_proj(X, self.Wk)  # [b, s, d / dev_cnt]
         V = self.V_proj(X, self.Wv)  # [b, s, d / dev_cnt]
@@ -197,32 +197,32 @@ class TransformerBlockInitComputationTP(Operator):
 
         # matmul
         print("simulating qkv") 
-        qkv_latency = 3 * ( #通过输入计算得到QKV
+        qkv_latency = 3 * ( #閫氳繃杈撳叆璁＄畻寰楀埌QKV
             self.Q_proj.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating q_mul_k")
-        q_mul_k_latency = ( #计算注意力权重A
+        q_mul_k_latency = ( #璁＄畻娉ㄦ剰鍔涙潈閲岮
             self.Q_mul_K.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating a_mul_v")
-        a_mul_v_latency = ( #计算注意力权重A与V的乘积H
+        a_mul_v_latency = ( #璁＄畻娉ㄦ剰鍔涙潈閲岮涓嶸鐨勪箻绉疕
             self.A_mul_V.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h_matmul0")
-        h_matmul0_latency = ( #前馈网络的线性层
+        h_matmul0_latency = ( #鍓嶉缃戠粶鐨勭嚎鎬у眰
             self.H_matmul0.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h1_matmul1")
-        h1_matmul1_latency = ( #前馈网络的线性层
+        h1_matmul1_latency = ( #鍓嶉缃戠粶鐨勭嚎鎬у眰
             self.H_matmul1.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h2_matmul2")
-        h2_matmul2_latency = ( #前馈网络的线性层
+        h2_matmul2_latency = ( #鍓嶉缃戠粶鐨勭嚎鎬у眰
             self.H_matmul2.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )

@@ -130,6 +130,7 @@ class Matmul(Operator):
         self.output_shape = None
         self.look_up_table = None
         self.best_mapping = None
+        self.best_stacked_mapping = None
 
     def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
         # [bs, M, K] * [K, N] = [bs, M, N]
@@ -265,10 +266,10 @@ class Matmul(Operator):
     class Stacked_Mapping:
         def __init__(
             self,
-            # l2_tile_M: int,
-            # l2_tile_N: int,
-            # l2_tile_K: int,
-            # is_l2_double_buffering: bool,
+            HBM_tile_M: int,
+            HBM_tile_N: int,
+            HBM_tile_K: int,
+            HBM_double_buffering: bool,
             core_tile_M: int,
             core_tile_N: int,
             core_tile_K: int,
@@ -279,10 +280,10 @@ class Matmul(Operator):
             l0_K_tiling_factor: int,
             dataflow: str = "os",
         ):
-            # self.l2_tile_M = l2_tile_M
-            # self.l2_tile_N = l2_tile_N
-            # self.l2_tile_K = l2_tile_K
-            # self.is_l2_double_buffering = is_l2_double_buffering
+            self.HBM_tile_M = HBM_tile_M
+            self.HBM_tile_N = HBM_tile_N
+            self.HBM_tile_K = HBM_tile_K
+            self.HBM_double_buffering = HBM_double_buffering
             self.core_tile_M = core_tile_M
             self.core_tile_N = core_tile_N
             self.core_tile_K = core_tile_K
@@ -306,13 +307,14 @@ class Matmul(Operator):
 
         return list(permutations) #将集合转换为列表，返回所有可能的排列组合
 
-    def compile_and_simulate(
+    def compile_and_simulate(  #核心功能是遍历生成mapping
         self,
         pcb_module: Device,
         compile_mode: str = "exhaustive",
     ):
         min_cycle_count = 2**63 - 1
         best_mapping = None
+        best_stacked_mapping = None
         M = self.computational_graph.M
         N = self.computational_graph.N
         K = self.computational_graph.K
@@ -425,346 +427,85 @@ class Matmul(Operator):
                                                 if cycle_count < min_cycle_count:
                                                     min_cycle_count = cycle_count
                                                     best_mapping = mapping
-        # elif compile_mode == "heuristic-our-throughput":
-        #     i = 0
-        #     for l2_tile_M in [32, 64, 128, 256, 512, 1024, 2048, 4096]:
-        #         for l2_tile_N in [
-        #             l2_tile_M // 4,
-        #             l2_tile_M // 2,
-        #             l2_tile_M,
-        #             l2_tile_M * 2,
-        #             l2_tile_M * 4,
-        #             l2_tile_M * 8,
-        #             l2_tile_M * 16,
-        #             l2_tile_M * 32,
-                    
-        #         ]:
-        #             l2_tile_K_max = (
-        #                 pcb_module.compute_module.l2_size
-        #                 // self.data_type.word_size
-        #                 // 2
-        #                 - l2_tile_M * l2_tile_N
-        #             ) // (l2_tile_M + l2_tile_N)
-        #             if l2_tile_K_max < 1:
-        #                 continue
-        #             l2_tile_K = min(l2_tile_K_max, K)
-        #             l2_tile_K = floor(log2(l2_tile_K))
-        #             l2_tile_K = 2**l2_tile_K
-        #             working_set_size = (
-        #                 l2_tile_N * l2_tile_K
-        #                 + l2_tile_M * l2_tile_K
-        #                 + l2_tile_M * l2_tile_N
-        #             )
-        #             if (
-        #                 working_set_size
-        #                 > pcb_module.compute_module.l2_size // self.data_type.word_size
-        #             ):
-        #                 continue
-        #             elif (
-        #                 working_set_size
-        #                 <= pcb_module.compute_module.l2_size
-        #                 // self.data_type.word_size
-        #                 // 2
-        #             ):
-        #                 is_l2_double_buffering = True
-        #             else:
-        #                 is_l2_double_buffering = False
+        elif compile_mode == "3D_stacked":
+            HBM_tile_M_log2 = ceil(log2(self.computational_graph.M / pcb_module.compute_module.core_count)) #每个HBM tile的M维度大小为五等分+1的二的次方，最后的多余部分采用remain进行单独计算
+            HBM_tile_N_log2 = ceil(log2(self.computational_graph.N / pcb_module.compute_module.core_count))
+            HBM_tile_K_log2 = ceil(log2(self.computational_graph.K))
+            HBM_TILE_M = 2 ** HBM_tile_M_log2
+            HBM_TILE_N = 2 ** HBM_tile_N_log2
+            HBM_TILE_K = 2 ** HBM_tile_K_log2
 
-        #             assert is_l2_double_buffering
-
-        #             for l1_tile_M in [32, 64, 128, 256]:
-        #                 l1_tile_M = min(l1_tile_M, l2_tile_M, l2_tile_N)
-        #                 # if l1_tile_M > min(l2_tile_M, l2_tile_N):
-        #                 #     continue
-        #                 l1_tile_N = l1_tile_M
-        #                 l1_tile_K_max = (
-        #                     pcb_module.compute_module.core.SRAM_size
-        #                     // self.data_type.word_size
-        #                     // 2
-        #                     - l1_tile_M * l1_tile_N
-        #                 ) // (l1_tile_M + l1_tile_N)
-        #                 if l1_tile_K_max < 1:
-        #                     continue
-        #                 l1_tile_K = min(l1_tile_K_max, l2_tile_K)
-        #                 l1_tile_K = floor(log2(l1_tile_K))
-        #                 l1_tile_K = 2**l1_tile_K
-
-        #                 if (
-        #                     l1_tile_M * l1_tile_N
-        #                     + l1_tile_N * l1_tile_K
-        #                     + l1_tile_M * l1_tile_K
-        #                     > pcb_module.compute_module.core.SRAM_size
-        #                     // self.data_type.word_size
-        #                     // 2
-        #                 ):
-        #                     continue
-        #                 l2_loop_order = "knm"
-        #                 l1_loop_order = "knm"
-        #                 for (
-        #                     l0_M_tiling_factor,
-        #                     l0_N_tiling_factor,
-        #                     l0_K_tiling_factor,
-        #                 ) in [(2, 2, 1)]:
-        #                     # self.find_permutations(
-        #                     #     pcb_module.compute_module.core.systolic_array_count
-        #                     # ):
-        #                     i += 1
-        #                     # start = time.time()
-        #                     mapping = self.Mapping(
-        #                         l2_tile_M,
-        #                         l2_tile_N,
-        #                         l2_tile_K,
-        #                         is_l2_double_buffering,
-        #                         l1_tile_M,
-        #                         l1_tile_N,
-        #                         l1_tile_K,
-        #                         l2_loop_order,
-        #                         l1_loop_order,
-        #                         l0_M_tiling_factor,
-        #                         l0_N_tiling_factor,
-        #                         l0_K_tiling_factor,
-        #                     )
-        #                     cycle_count = self.simulate(
-        #                         self.computational_graph,
-        #                         mapping,
-        #                         pcb_module,
-        #                     )
-        #                     # end = time.time()
-        #                     # if i % 1000 == 0:
-        #                     #     print(f"{i} simulation time: {end-start}")
-        #                     if cycle_count < min_cycle_count:
-        #                         min_cycle_count = cycle_count
-        #                         best_mapping = mapping
-        # elif compile_mode == "heuristic-GPU":
-        #     i = 0
-        #     for l2_tile_M in [64, 128, 256, 512, 1024, 2048]:
-        #         for l2_tile_N in [l2_tile_M // 2, l2_tile_M, l2_tile_M * 2]:
-        #             if K <= 12288:
-        #                 l2_K_tiling_factor_list = [1, 2, 4, 8]
-        #             else:
-        #                 l2_K_tiling_factor_list = [
-        #                     K // 1024,
-        #                     K // 2048,
-        #                     K // 4096,
-        #                     K // 8192,
-        #                 ]
-        #             for l2_K_tiling_factor in l2_K_tiling_factor_list:
-        #                 l2_tile_K = ceil(
-        #                     self.computational_graph.K / l2_K_tiling_factor
-        #                 )
-        #                 l2_tile_K = 2 ** floor(log2(l2_tile_K))
-        #                 working_set_size = (
-        #                     l2_tile_N * l2_tile_K
-        #                     + l2_tile_M * l2_tile_K
-        #                     + l2_tile_M * l2_tile_N
-        #                 )
-        #                 if (
-        #                     working_set_size
-        #                     > pcb_module.compute_module.l2_size
-        #                     // self.data_type.word_size
-        #                 ):
-        #                     continue
-        #                 elif (
-        #                     working_set_size
-        #                     <= pcb_module.compute_module.l2_size
-        #                     // self.data_type.word_size
-        #                     // 2
-        #                 ):
-        #                     is_l2_double_buffering = True
-        #                 else:
-        #                     is_l2_double_buffering = False
-
-        #                 for l1_tile_M in [32, 64, 128, 256]:
-        #                     if l1_tile_M > min(l2_tile_M, l2_tile_N):
-        #                         continue
-        #                     l1_tile_N = l1_tile_M
-        #                     for l1_K_tiling_factor in [1, 2, 4, 8, 16, 32]:
-        #                         l1_tile_K = ceil(l2_tile_K / l1_K_tiling_factor)
-        #                         if (
-        #                             l1_tile_M * l1_tile_N
-        #                             + l1_tile_N * l1_tile_K
-        #                             + l1_tile_M * l1_tile_K
-        #                             > pcb_module.compute_module.core.SRAM_size
-        #                             // self.data_type.word_size
-        #                             // 2
-        #                         ):
-        #                             continue
-        #                         l2_loop_order = "knm"
-        #                         l1_loop_order = "knm"
-        #                         for (
-        #                             l0_M_tiling_factor,
-        #                             l0_N_tiling_factor,
-        #                             l0_K_tiling_factor,
-        #                         ) in self.find_permutations(
-        #                             pcb_module.compute_module.core.systolic_array_count
-        #                         ):
-        #                             i += 1
-        #                             start = time.time()
-        #                             mapping = self.Mapping(
-        #                                 l2_tile_M,
-        #                                 l2_tile_N,
-        #                                 l2_tile_K,
-        #                                 is_l2_double_buffering,
-        #                                 l1_tile_M,
-        #                                 l1_tile_N,
-        #                                 l1_tile_K,
-        #                                 l2_loop_order,
-        #                                 l1_loop_order,
-        #                                 l0_M_tiling_factor,
-        #                                 l0_N_tiling_factor,
-        #                                 l0_K_tiling_factor,
-        #                             )
-        #                             cycle_count = self.simulate(
-        #                                 self.computational_graph,
-        #                                 mapping,
-        #                                 pcb_module,
-        #                             )
-        #                             end = time.time()
-        #                             # if i % 1000 == 0:
-        #                             #     print(f"{i} simulation time: {end-start}")
-        #                             if cycle_count < min_cycle_count:
-        #                                 min_cycle_count = cycle_count
-        #                                 best_mapping = mapping
-        #     # print("total dse times:", i)
-        # elif compile_mode == "heuristic-TPU":
-        #     l2_tile_M = self.computational_graph.M
-        #     l2_tile_N = self.computational_graph.N
-        #     l2_tile_K = self.computational_graph.K
-
-        #     is_l2_double_buffering = True
-        #     for l1_tile_M in [l2_tile_M, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-        #         if l1_tile_M > l2_tile_M * 2:
-        #             continue
-        #         for l1_tile_N in [
-        #             l1_tile_M // 2,
-        #             l1_tile_M,
-        #             l1_tile_M * 2,
-        #             l1_tile_M * 8,
-        #             l1_tile_M * 16,
-        #             l1_tile_M * 64,
-        #             l1_tile_M * 128,
-        #             l1_tile_M * 256,
-        #         ]:
-        #             if l1_tile_N > l2_tile_N:
-        #                 continue
-        #             if l1_tile_N <= 0:
-        #                 continue
-        #             l1_tile_K_max = (
-        #                 pcb_module.compute_module.core.SRAM_size
-        #                 // self.data_type.word_size
-        #                 // 2
-        #                 - l1_tile_M * l1_tile_N
-        #             ) // (l1_tile_M + l1_tile_N)
-        #             if l1_tile_K_max < 1:
-        #                 continue
-        #             l1_tile_K = min(l1_tile_K_max, l2_tile_K)
-        #             l1_tile_K = floor(log2(l1_tile_K))
-        #             l1_tile_K = 2**l1_tile_K
-
-        #             l2_loop_order = "knm"
-        #             l1_loop_order = "knm"
-        #             for (
-        #                 l0_M_tiling_factor,
-        #                 l0_N_tiling_factor,
-        #                 l0_K_tiling_factor,
-        #             ) in [(1, 2, 1)]:
-        #                 mapping = self.Mapping(
-        #                     l2_tile_M,
-        #                     l2_tile_N,
-        #                     l2_tile_K,
-        #                     is_l2_double_buffering,
-        #                     l1_tile_M,
-        #                     l1_tile_N,
-        #                     l1_tile_K,
-        #                     l2_loop_order,
-        #                     l1_loop_order,
-        #                     l0_M_tiling_factor,
-        #                     l0_N_tiling_factor,
-        #                     l0_K_tiling_factor,
-        #                 )
-        #                 # mapping.display()
-        #                 # start=time.time()
-        #                 cycle_count = self.simulate(
-        #                     self.computational_graph,
-        #                     mapping,
-        #                     pcb_module,
-        #                 )
-        #                 # end=time.time()
-        #                 # print(f'simulation time: {end-start}')
-        #                 if cycle_count < min_cycle_count:
-        #                     min_cycle_count = cycle_count
-        #                     best_mapping = mapping
-        # elif compile_mode == "heuristic-TPU-new":
-        #     l2_tile_M = self.computational_graph.M
-        #     l2_tile_N = self.computational_graph.N
-        #     l2_tile_K = self.computational_graph.K
-
-        #     is_l2_double_buffering = True
-        #     for l1_tile_M in [l2_tile_M, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]:
-        #         if l1_tile_M > l2_tile_M * 2:
-        #             continue
-        #         for l1_tile_N in [
-        #             l1_tile_M // 2,
-        #             l1_tile_M,
-        #             l1_tile_M * 2,
-        #             l1_tile_M * 8,
-        #             l1_tile_M * 16,
-        #             l1_tile_M * 64,
-        #             l1_tile_M * 128,
-        #             l1_tile_M * 256,
-        #         ]:
-        #             if l1_tile_N > l2_tile_N:
-        #                 continue
-        #             if l1_tile_N <= 0:
-        #                 continue
-        #             l1_tile_K_max = (
-        #                 pcb_module.compute_module.core.SRAM_size
-        #                 // self.data_type.word_size
-        #                 // 2
-        #                 - l1_tile_M * l1_tile_N
-        #             ) // (l1_tile_M + l1_tile_N)
-        #             if l1_tile_K_max < 1:
-        #                 continue
-        #             l1_tile_K = min(l1_tile_K_max, l2_tile_K)
-        #             l1_tile_K = floor(log2(l1_tile_K))
-        #             l1_tile_K = 2**l1_tile_K
-
-        #             l2_loop_order = "knm"
-        #             l1_loop_order = "knm"
-        #             for (
-        #                 l0_M_tiling_factor,
-        #                 l0_N_tiling_factor,
-        #                 l0_K_tiling_factor,
-        #             ) in [(1, 1, 1)]:
-        #                 mapping = self.Mapping(
-        #                     l2_tile_M,
-        #                     l2_tile_N,
-        #                     l2_tile_K,
-        #                     is_l2_double_buffering,
-        #                     l1_tile_M,
-        #                     l1_tile_N,
-        #                     l1_tile_K,
-        #                     l2_loop_order,
-        #                     l1_loop_order,
-        #                     l0_M_tiling_factor,
-        #                     l0_N_tiling_factor,
-        #                     l0_K_tiling_factor,
-        #                 )
-        #                 # mapping.display()
-        #                 # start=time.time()
-        #                 cycle_count = self.simulate(
-        #                     self.computational_graph,
-        #                     mapping,
-        #                     pcb_module,
-        #                 )
-        #                 # end=time.time()
-        #                 # print(f'simulation time: {end-start}')
-        #                 if cycle_count < min_cycle_count:
-        #                     min_cycle_count = cycle_count
-        #                     best_mapping = mapping
+            working_set_size = (
+                HBM_TILE_N * HBM_TILE_K
+                + HBM_TILE_M * HBM_TILE_K
+                + HBM_TILE_M * HBM_TILE_N
+            )
+            assert working_set_size <= pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count // self.data_type.word_size, "HBM tile size exceeds memory capacity"
+            
+            if (
+                working_set_size
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count)
+                // self.data_type.word_size
+                // 2
+            ):
+                HBM_double_buffering = True
+            else:
+                HBM_double_buffering = False
+            for core_tile_M_log2 in range(5, HBM_tile_M_log2 + 1):
+                core_tile_M = 2**core_tile_M_log2
+                for core_tile_N_log2 in range(5, HBM_tile_N_log2 + 1):
+                    core_tile_N = 2**core_tile_N_log2
+                    for core_tile_K_log2 in range(5, HBM_tile_K_log2 + 1):
+                        core_tile_K = 2**core_tile_K_log2
+                        if (
+                            core_tile_M * core_tile_N
+                            + core_tile_N * core_tile_K
+                            + core_tile_M * core_tile_K
+                            > pcb_module.compute_module.core.SRAM_size
+                            // self.data_type.word_size
+                            // 2
+                        ):
+                            continue
+                        for core_loop_order in [
+                            "mkn",
+                            "mnk",
+                            "nkm",
+                            "nmk",
+                            "knm",
+                            "kmn",
+                        ]:
+                            for (
+                                l0_M_tiling_factor,
+                                l0_N_tiling_factor,
+                                l0_K_tiling_factor,
+                            ) in self.find_permutations(
+                                pcb_module.compute_module.core.systolic_array_count
+                            ):
+                                stacked_mapping = self.Stacked_Mapping(
+                                    HBM_TILE_M,
+                                    HBM_TILE_N,
+                                    HBM_TILE_K,
+                                    HBM_double_buffering,
+                                    core_tile_M,
+                                    core_tile_N,
+                                    core_tile_K,
+                                    core_loop_order,
+                                    l0_M_tiling_factor,
+                                    l0_N_tiling_factor,
+                                    l0_K_tiling_factor,
+                                )
+                                cycle_count = self.stacked_simulate(
+                                    self.computational_graph,
+                                    stacked_mapping,
+                                    pcb_module,
+                                )
+                                if cycle_count < min_cycle_count:
+                                    min_cycle_count = cycle_count
+                                    best_stacked_mapping = stacked_mapping
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
         self.best_mapping = best_mapping
+        self.best_stacked_mapping = best_stacked_mapping
         # if self.best_mapping is not None:
         #     self.best_mapping.display()
         self.best_cycle_count = min_cycle_count
@@ -1005,6 +746,168 @@ class Matmul(Operator):
         # pcb_module.io_module.latency * 2 * pcb_module.compute_module.clock_freq
         # )
 
+    def stacked_simulate( #根据mapping进行任务分割
+        self,
+        computational_graph:ComputationalGraph,
+        stacked_mapping:Stacked_Mapping,
+        pcb_module:Device,
+    ) -> int:
+        if self.look_up_table is None:
+            self.look_up_table = pd.read_csv(
+                f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
+                header=None,
+                names=[
+                    "M",
+                    "N",
+                    "K",
+                    "ArrayHeight",
+                    "ArrayWidth",
+                    "Dataflow",
+                    "cycle_count",
+                    "util_rate",
+                ],
+            )
+            self.look_up_table.drop_duplicates(
+                inplace=True,
+                subset=["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
+            )
+            # self.look_up_table.reset_index(drop=True, inplace=True)
+            # self.look_up_table.to_csv(
+            #     f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
+            #     header=False,
+            #     index=False,
+            # )
+            self.look_up_table.set_index(
+                ["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
+                inplace=True,
+            )
+        # print(self.look_up_table)
+        # print(self.look_up_table.loc[(32, 16, 256, 16, 16, 'os'), "cycle_count"
+        #                              ].item())
+        # print('sdfsdfsdfsd')
+        # exit()
+
+        M = computational_graph.M
+        N = computational_graph.N
+        K = computational_graph.K
+        data_type = computational_graph.data_type
+
+        HBM_tile_M = stacked_mapping.HBM_tile_M
+        HBM_tile_N = stacked_mapping.HBM_tile_N
+        HBM_tile_K = stacked_mapping.HBM_tile_K
+
+        if stacked_mapping.HBM_double_buffering:
+            assert (
+                HBM_tile_M * HBM_tile_N + HBM_tile_N * HBM_tile_K + HBM_tile_M * HBM_tile_K
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count) // self.data_type.word_size // 2
+            )
+        else:
+            assert (
+                HBM_tile_M * HBM_tile_N + HBM_tile_N * HBM_tile_K + HBM_tile_M * HBM_tile_K
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count) // self.data_type.word_size
+            )
+
+        
+        M_HBM_t = M // HBM_tile_M
+        N_HBM_t = N // HBM_tile_N
+        K_HBM_t = K // HBM_tile_K 
+        # TODO:这里的K维度切分可能需要修改,因为选择的HBM tile的K维度基本大于实际的K维度，而实际不打算对K维度进行切分
+        M_remain = M % HBM_tile_M
+        N_remain = N % HBM_tile_N
+        K_remain = K % HBM_tile_K
+
+        hbm_tiles = np.empty( # 创建一个三维数组，将每一个子矩阵乘作为一个对象，类型是HBMTileSimulator
+            [ceil(M / HBM_tile_M), ceil(N / HBM_tile_N), ceil(K / HBM_tile_K)],
+            dtype=self.HBMTileSimulator,
+        )
+        
+        if M_HBM_t * N_HBM_t * K_HBM_t != 0:
+            hbm_tiles[:M_HBM_t, :N_HBM_t, :K_HBM_t] = self.HBMTileSimulator(
+                HBM_tile_M,
+                HBM_tile_N,
+                HBM_tile_K,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if M_remain != 0:
+            hbm_tiles[-1, :N_HBM_t, :K_HBM_t] = self.HBMTileSimulator(
+                M_remain,
+                HBM_tile_N,
+                HBM_tile_K,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if N_remain != 0:
+            hbm_tiles[:M_HBM_t, -1, :K_HBM_t] = self.HBMTileSimulator(
+                HBM_tile_M,
+                N_remain,
+                HBM_tile_K,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if K_remain != 0:
+            hbm_tiles[:M_HBM_t, :N_HBM_t, -1] = self.HBMTileSimulator(
+                HBM_tile_M,
+                HBM_tile_N,
+                K_remain,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if M_remain * N_remain != 0:
+            hbm_tiles[-1, -1, :K_HBM_t] = self.HBMTileSimulator(
+                M_remain,
+                N_remain,
+                HBM_tile_K,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if M_remain * K_remain != 0:    
+            hbm_tiles[-1, :N_HBM_t, -1] = self.HBMTileSimulator(
+                M_remain,
+                HBM_tile_N,
+                K_remain,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if N_remain * K_remain != 0:
+            hbm_tiles[:M_HBM_t, -1, -1] = self.HBMTileSimulator(
+                HBM_tile_M,
+                N_remain,
+                K_remain,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+        if M_remain * N_remain * K_remain != 0:
+            hbm_tiles[-1, -1, -1] = self.HBMTileSimulator(
+                M_remain,
+                N_remain,
+                K_remain,
+                data_type,
+                stacked_mapping,
+                pcb_module,
+                self.look_up_table,
+            )
+
+        total_cycle_count = 0
+
+
+
+        return total_cycle_count
+
     class L2TileSimulator:
         def __init__(
             self,
@@ -1041,7 +944,7 @@ class Matmul(Operator):
             self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
                 M, N, K, data_type, mapping, pcb_module, look_up_table
             )
-#TODO：修改成从主存中读取数据到片上内存的周期数（好像不太对，近存算力应该是数据直接存core上的内存中）
+# //修改成从主存中读取数据到片上内存的周期数（好像不太对，近存算力应该是数据直接存core上的内存中）
         def simulate_l2_tile_io_cycle_count(
             self, M: int, N: int, data_type: DataType, chiplet_module: Device
         ):
@@ -1326,6 +1229,312 @@ class Matmul(Operator):
 
             return total_cycle_count
 
+    class HBMTileSimulator:
+        def __init__(
+            self,
+            M: int,
+            N: int,
+            K: int,
+            data_type: DataType,
+            Stacked_Mapping: "Matmul.Stacked_Mapping",
+            pcb_module: Device,
+            look_up_table: pd.DataFrame,
+        ):
+            # print(f'HBM tile: {M} {N} {K}')
+            self.M = M
+            self.N = N
+            self.K = K
+            self.compute_cycle_count = self.simulate_hbm_tile_compute_cycle_count(
+                M, N, K, data_type, Stacked_Mapping, pcb_module, look_up_table
+            )
+
+        def simulate_hbm_tile_compute_cycle_count(
+            self,
+            M: int,
+            N: int,
+            K: int,
+            data_type: DataType,
+            Stacked_Mapping: "Matmul.Stacked_Mapping",
+            pcb_module: Device,
+            look_up_table: pd.DataFrame,
+        ):
+            core_tile_M = Stacked_Mapping.core_tile_M
+            core_tile_N = Stacked_Mapping.core_tile_N
+            core_tile_K = Stacked_Mapping.core_tile_K
+
+            M_core_t = M // core_tile_M
+            N_core_t = N // core_tile_N
+            K_core_t = K // core_tile_K
+            M_remain = M % core_tile_M
+            N_remain = N % core_tile_N
+            K_remain = K % core_tile_K
+
+            core_tiles = np.empty(
+                [ceil(M / core_tile_M), ceil(N / core_tile_N), ceil(K / core_tile_K)],
+                dtype=Matmul.CoreTileSimulator,
+            )
+            if M_core_t * N_core_t * K_core_t != 0:
+                core_tiles[:M_core_t, :N_core_t, :K_core_t] = Matmul.CoreTileSimulator(
+                    core_tile_M,
+                    core_tile_N,
+                    core_tile_K,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if M_remain != 0:
+                core_tiles[-1, :N_core_t, :K_core_t] = Matmul.CoreTileSimulator(
+                    M_remain,
+                    core_tile_N,
+                    core_tile_K,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if N_remain != 0:
+                core_tiles[:M_core_t, -1, :K_core_t] = Matmul.CoreTileSimulator(
+                    core_tile_M,
+                    N_remain,
+                    core_tile_K,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if K_remain != 0:
+                core_tiles[:M_core_t, :N_core_t, -1] = Matmul.CoreTileSimulator(
+                    core_tile_M,
+                    core_tile_N,
+                    K_remain,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if M_remain * N_remain != 0:
+                core_tiles[-1, -1, :K_core_t] = Matmul.CoreTileSimulator(
+                    M_remain,
+                    N_remain,
+                    core_tile_K,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if M_remain * K_remain != 0:
+                core_tiles[-1, :N_core_t, -1] = Matmul.CoreTileSimulator(
+                    M_remain,
+                    core_tile_N,
+                    K_remain,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if N_remain * K_remain != 0:
+                core_tiles[:M_core_t, -1, -1] = Matmul.CoreTileSimulator(
+                    core_tile_M,
+                    N_remain,
+                    K_remain,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            if M_remain * N_remain * K_remain != 0:
+                core_tiles[-1, -1, -1] = Matmul.CoreTileSimulator(
+                    M_remain,
+                    N_remain,
+                    K_remain,
+                    data_type,
+                    Stacked_Mapping,
+                    pcb_module,
+                    look_up_table,
+                )
+            
+
+
+            
+            
+            
+
+            # ?从这里开始往下不太确定需不需要修改，先照L2 Tile的方式写着
+            M_K_tile_size = np.zeros(
+                [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=int
+            )
+            M_K_tile_size[:M_core_t, :K_core_t] = core_tile_M * core_tile_K
+            if M_remain > 0:
+                M_K_tile_size[-1, :K_core_t] = M_remain * core_tile_K
+            if K_remain > 0:
+                M_K_tile_size[:M_core_t, -1] = core_tile_M * K_remain
+            if M_remain > 0 and K_remain > 0:
+                M_K_tile_size[-1, -1] = M_remain * K_remain
+
+            K_N_tile_size = np.zeros(
+                [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=int
+            )
+            K_N_tile_size[:K_core_t, :N_core_t] = core_tile_K * core_tile_N
+            if K_remain > 0:
+                K_N_tile_size[-1, :N_core_t] = K_remain * core_tile_N
+            if N_remain > 0:
+                K_N_tile_size[:K_core_t, -1] = core_tile_K * N_remain
+            if K_remain > 0 and N_remain > 0:
+                K_N_tile_size[-1, -1] = K_remain * N_remain
+
+            M_N_tile_size = np.zeros(
+                [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=int
+            )
+            M_N_tile_size[:M_core_t, :N_core_t] = core_tile_M * core_tile_N
+            if M_remain > 0:
+                M_N_tile_size[-1, :N_core_t] = M_remain * core_tile_N
+            if N_remain > 0:
+                M_N_tile_size[:M_core_t, -1] = core_tile_M * N_remain
+            if M_remain > 0 and N_remain > 0:
+                M_N_tile_size[-1, -1] = M_remain * N_remain
+
+            total_cycle_count = 0
+            previous_batch_Read_M_K = np.zeros(
+                [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
+            )
+            previous_batch_Read_K_N = np.zeros(
+                [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
+            )
+            previous_batch_Read_M_N = np.zeros(
+                [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+            )
+            previous_batch_Write_M_N = np.zeros(
+                [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+            )
+            previous_batch_compute_cycle_count = 0
+            active_core_tile_list = []
+            # !这一块应该不太对，HBM Tile层级不考虑mnk的循环顺序，每个HBM Tile之间是并行关系
+            for m, n, k in Matmul.generate_tile_loops(
+                ceil(M / core_tile_M),
+                ceil(N / core_tile_N),
+                ceil(K / core_tile_K),
+                Stacked_Mapping.core_loop_order,
+            ):
+                
+                active_core_tile_list.append((m, n, k, core_tiles[m, n, k]))
+                if (
+                    m == ceil(M / core_tile_M) - 1
+                    and n == ceil(N / core_tile_N) - 1
+                    and k == ceil(K / core_tile_K) - 1
+                ):
+                    pass
+                elif (
+                    len(active_core_tile_list)
+                    < pcb_module.compute_module.core_count
+                ):
+                    continue
+
+                assert (
+                    len(active_core_tile_list)
+                    <= pcb_module.compute_module.core_count
+                )
+                current_batch_Read_M_K = np.zeros(
+                    [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
+                )
+                current_batch_Read_K_N = np.zeros(
+                    [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
+                )
+                current_batch_Read_M_N = np.zeros(
+                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                )
+                current_batch_Write_M_N = np.zeros(
+                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                )
+
+                current_batch_compute_cycle_count = 0
+                for i in range(len(active_core_tile_list)):
+                    temp_m, temp_n, temp_k, temp_core_tile = active_core_tile_list[i]
+                    current_batch_Read_M_K[temp_m, temp_k] = 1
+                    current_batch_Read_K_N[temp_k, temp_n] = 1
+                    current_batch_Read_M_N[temp_m, temp_n] = temp_k > 0
+                    current_batch_Write_M_N[temp_m, temp_n] = 1
+                    temp_core_tile_compute_cycle_count = temp_core_tile.compute_cycle_count
+                    if temp_k > 0:
+                        temp_core_tile_compute_cycle_count += ceil(
+                            temp_core_tile.M
+                            * temp_core_tile.N
+                            / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+                        )
+                    current_batch_compute_cycle_count = max(
+                        current_batch_compute_cycle_count,
+                        temp_core_tile_compute_cycle_count,
+                    )
+
+                # if one output tile in this batch shares input/output with another output tile in the previous batch, assign them to the same core to avoid data movement
+                # note that of the three input matrix mk, kn, mn, at most one of them can be the same if we change m,n,k
+                current_batch_M_K_read_count = np.sum(
+                    (current_batch_Read_M_K * (~previous_batch_Read_M_K))
+                    * M_K_tile_size
+                )
+                current_batch_K_N_read_count = np.sum(
+                    (current_batch_Read_K_N * (~previous_batch_Read_K_N))
+                    * K_N_tile_size
+                )
+                current_batch_M_N_read_count = np.sum(
+                    (
+                        current_batch_Read_M_N
+                        * (~(previous_batch_Read_M_N + previous_batch_Write_M_N))
+                    )
+                    * M_N_tile_size
+                )
+                previous_batch_M_N_write_count = np.sum(
+                    (previous_batch_Write_M_N * (~current_batch_Read_M_N))
+                    * M_N_tile_size
+                )
+
+                # read current batch while compute and write previous batch 流水线处理
+                current_batch_read_count = (
+                    current_batch_M_K_read_count
+                    + current_batch_K_N_read_count
+                    + current_batch_M_N_read_count
+                )
+                current_batch_read_cycle_count = ceil(
+                    current_batch_read_count
+                    * pcb_module.compute_module.core.systolic_array.input_word_size
+                    / pcb_module.compute_module.channel_bandwidth_per_cycle
+                )
+                prvious_batch_write_cycle_count = ceil(
+                    previous_batch_M_N_write_count
+                    * pcb_module.compute_module.core.systolic_array.output_word_size
+                    / pcb_module.compute_module.channel_bandwidth_per_cycle
+                )
+
+                total_cycle_count += (
+                    max(
+                        current_batch_read_cycle_count,
+                        previous_batch_compute_cycle_count,
+                    )
+                    + prvious_batch_write_cycle_count
+                )
+
+                previous_batch_compute_cycle_count = current_batch_compute_cycle_count
+                previous_batch_Read_M_K = copy.deepcopy(current_batch_Read_M_K)
+                previous_batch_Read_K_N = copy.deepcopy(current_batch_Read_K_N)
+                previous_batch_Read_M_N = copy.deepcopy(current_batch_Read_M_N)
+                previous_batch_Write_M_N = copy.deepcopy(current_batch_Write_M_N)
+
+                active_core_tile_list = []
+
+            # last batch's compute and write
+            total_cycle_count += previous_batch_compute_cycle_count + ceil(
+                np.sum(previous_batch_Write_M_N * M_N_tile_size)
+                * data_type.word_size
+                / pcb_module.compute_module.channel_bandwidth_per_cycle
+            )
+
+            return total_cycle_count
+
+            
+
+
+
+
     class L1TileSimulator:
         def __init__(
             self,
@@ -1388,6 +1597,77 @@ class Matmul(Operator):
             )
 
             return compute_cycle_count
+    
+    # ! Core Tile Simulator需要添加对于输入矩阵的位置的判定，后续考虑接入NoC的模拟器
+    class CoreTileSimulator:
+        def __init__(
+            self,
+            M: int,
+            N: int,
+            K: int,
+            data_type: DataType,
+            Stacked_Mapping: "Matmul.Stacked_Mapping",
+            pcb_module: Device,
+            look_up_table: pd.DataFrame,
+        ):
+            # print(f'Core tile: {M} {N} {K}')
+            self.M = M
+            self.N = N
+            self.K = K
+            self.compute_cycle_count = Matmul.simulate_systolic_array_cycle_count(
+                look_up_table,
+                M,
+                N,
+                K,
+                pcb_module.compute_module.core.systolic_array.array_height,
+                pcb_module.compute_module.core.systolic_array.array_width,
+                pcb_module.compute_module.core.systolic_array.mac_per_cycle,
+                Stacked_Mapping.dataflow,
+            )
+
+        def simulate_core_tile_compute_cycle_count(
+            self,
+            M: int,
+            N: int,
+            K: int,
+            data_type: DataType,
+            Stacked_Mapping: "Matmul.Stacked_Mapping",
+            pcb_module: Device,
+            look_up_table: pd.DataFrame,
+        ):
+            assert (
+                M * K + K * N + M * N
+                <= pcb_module.compute_module.core.SRAM_size
+                // data_type.word_size
+                // 2
+            )
+
+            M_tiling_factor = Stacked_Mapping.l0_M_tiling_factor
+            N_tiling_factor = Stacked_Mapping.l0_N_tiling_factor
+            K_tiling_factor = Stacked_Mapping.l0_K_tiling_factor
+            assert (
+                M_tiling_factor * K_tiling_factor * N_tiling_factor
+                <= pcb_module.compute_module.core.systolic_array_count
+            )
+
+            compute_cycle_count = ceil(
+                Matmul.simulate_systolic_array_cycle_count(
+                    look_up_table,
+                    ceil(M / M_tiling_factor),
+                    ceil(N / N_tiling_factor),
+                    ceil(K / K_tiling_factor),
+                    pcb_module.compute_module.core.systolic_array.array_height,
+                    pcb_module.compute_module.core.systolic_array.array_width,
+                    pcb_module.compute_module.core.systolic_array.mac_per_cycle,
+                    Stacked_Mapping.dataflow,
+                )
+                + (K_tiling_factor - 1)
+                * M
+                * N
+                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+            )
+            return compute_cycle_count
+        
 
     @staticmethod
     def simulate_systolic_array_cycle_count(
