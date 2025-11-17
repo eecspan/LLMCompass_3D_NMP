@@ -78,7 +78,8 @@ def template_to_system(arch_specs):
     )
     # memory module
     memory_module = MemoryModule(
-        device_specs["memory"]["total_capacity_GB"] * 1024 * 1024 * 1024
+        device_specs["memory"]["total_capacity_GB"] * 1024 * 1024 * 1024,
+        io_specs["memory_channel_active_count"],
     )
     # device
     device = Device(compute_module, io_module, memory_module)

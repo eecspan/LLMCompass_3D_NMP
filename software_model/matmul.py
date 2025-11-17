@@ -1010,7 +1010,6 @@ class Matmul(Operator):
             self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
                 M, N, K, data_type, mapping, pcb_module, look_up_table
             )
-#TODO：修改成从主存中读取数据到片上内存的周期数（好像不太对，近存算力应该是数据直接存core上的内存中）
         def simulate_l2_tile_io_cycle_count(
             self, M: int, N: int, data_type: DataType, chiplet_module: Device
         ):

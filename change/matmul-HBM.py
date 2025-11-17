@@ -1,5 +1,5 @@
 from utils import size
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from hardware_model.device import Device
 from software_model.operators import Operator
 from software_model.utils import Tensor, DataType
@@ -279,6 +279,9 @@ class Matmul(Operator):
             l0_N_tiling_factor: int,
             l0_K_tiling_factor: int,
             dataflow: str = "os",
+            # 新增：HBM 批次调度策略
+            hbm_schedule: str = "diagonal",  # 可选: row-major | col-major | diagonal | diagonal-channel | custom
+            custom_batches: Optional["List[List[Tuple[int,int,int]]]"] = None,  # 若 hbm_schedule == custom，则使用该批次定义
         ):
             self.HBM_tile_M = HBM_tile_M
             self.HBM_tile_N = HBM_tile_N
@@ -293,6 +296,8 @@ class Matmul(Operator):
             self.l0_N_tiling_factor = l0_N_tiling_factor
             self.l0_K_tiling_factor = l0_K_tiling_factor
             self.dataflow = dataflow
+            self.hbm_schedule = hbm_schedule
+            self.custom_batches = custom_batches
     
     @staticmethod
     def find_permutations(n): #这个函数仅用于L0级的脉动阵列优化处理
@@ -306,6 +311,96 @@ class Matmul(Operator):
                         permutations.add((i, j, k))
 
         return list(permutations) #将集合转换为列表，返回所有可能的排列组合
+
+    @staticmethod
+    def generate_hbm_batches(
+        M_tiles: int,
+        N_tiles: int,
+        K_tiles: int,
+        core_count: int,
+        schedule: str = "diagonal-channel", #暂时先考虑对角线调度
+        custom_batches: Optional["List[List[Tuple[int,int,int]]]"] = None,
+    ) -> "List[List[Tuple[int,int,int]]]":
+        """生成分批执行的 HBM tile 列表。
+        返回值为批次列表；每个批次是 (m_idx, n_idx, k_idx) 元组的列表；
+        同一批次内的 tile 视为并行执行，批次时长取该批次内最长 tile 时长。
+
+        预置策略：
+        - row-major: 先按 k，从小到大；k 固定时按 m 行、n 列扫描，将每批最多 core_count 个 tile 打包。
+        - col-major: 与上类似，但 n 优先。
+        - diagonal: 对 (m, n) 网格按反对角线 (m+n = 常数) 切片，每片最多 core_count 个。
+        - diagonal-channel: 针对 M_tiles == N_tiles 的“对角移位”调度；
+          第 b 批为 core c 分配 (m=c, n=(c+b)%N_tiles, k=0)。若 K_tiles>1，则对每个 k 顺序重复该模式。
+        - custom: 使用 custom_batches 直接指定批次。
+
+        - todo:这一块的函数要仔细检查
+        """
+        batches: List[List[Tuple[int,int,int]]] = []
+
+        if schedule == "custom":
+            return custom_batches or []
+
+        def chunk(items: List[Tuple[int,int,int]], n: int) -> List[List[Tuple[int,int,int]]]:
+            return [items[i:i+n] for i in range(0, len(items), n)]
+
+        if schedule == "row-major":
+            for k in range(K_tiles):
+                flat: List[Tuple[int,int,int]] = []
+                for m in range(M_tiles):
+                    for n in range(N_tiles):
+                        flat.append((m, n, k))
+                batches.extend(chunk(flat, core_count))
+            return batches
+
+        if schedule == "col-major":
+            for k in range(K_tiles):
+                flat: List[Tuple[int,int,int]] = []
+                for n in range(N_tiles):
+                    for m in range(M_tiles):
+                        flat.append((m, n, k))
+                batches.extend(chunk(flat, core_count))
+            return batches
+
+        if schedule == "diagonal":
+            for k in range(K_tiles):
+                # 反对角线：s = m + n，从 0 到 (M_tiles+N_tiles-2)
+                for s in range(M_tiles + N_tiles - 1):
+                    diag: List[Tuple[int,int,int]] = []
+                    m_start = max(0, s - (N_tiles - 1))
+                    m_end = min(M_tiles - 1, s)
+                    for m in range(m_start, m_end + 1):
+                        n = s - m
+                        diag.append((m, n, k))
+                    batches.extend(chunk(diag, core_count))
+            return batches
+
+        if schedule == "diagonal-channel":
+            # 针对“对角运算”需求；要求 M_tiles 与 N_tiles 至少覆盖 core_count
+            # k 维度顺序执行；每个 k 上进行 B = max(M_tiles, N_tiles) 个批次
+            C = min(M_tiles, N_tiles)
+            if C == 0:
+                return []
+            B = max(M_tiles, N_tiles)
+            for k in range(K_tiles):
+                for b in range(B):
+                    batch: List[Tuple[int,int,int]] = []
+                    # 为每个 core 分配一个 (m, n)
+                    for c in range(min(core_count, C)):
+                        m = c % M_tiles
+                        n = (c + b) % N_tiles
+                        batch.append((m, n, k))
+                    if batch:
+                        batches.append(batch)
+            return batches
+
+        # 默认退化为 row-major
+        for k in range(K_tiles):
+            flat: List[Tuple[int,int,int]] = []
+            for m in range(M_tiles):
+                for n in range(N_tiles):
+                    flat.append((m, n, k))
+            batches.extend(chunk(flat, core_count))
+        return batches
 
     def compile_and_simulate(  #核心功能是遍历生成mapping
         self,
@@ -677,7 +772,7 @@ class Matmul(Operator):
         previous_n = 0
         previous_k = 0
 
-        for m, n, k in self.generate_tile_loops(
+        for m, n, k in self.generate_tile_loops( #对L2 tile的循环顺序进行遍历
             ceil(M / l2_tile_M),
             ceil(N / l2_tile_N),
             ceil(K / l2_tile_K),
@@ -904,7 +999,30 @@ class Matmul(Operator):
 
         total_cycle_count = 0
 
+        
+        # *生成批次调度
+        core_count = pcb_module.compute_module.core_count
+        batches = self.generate_hbm_batches(
+            M_tiles=ceil(M / HBM_tile_M),
+            N_tiles=ceil(N / HBM_tile_N),
+            K_tiles=ceil(K / HBM_tile_K),
+            core_count=core_count,
+            schedule=getattr(stacked_mapping, "hbm_schedule", "row-major"),
+            custom_batches=getattr(stacked_mapping, "custom_batches", None),
+        )
 
+        for batch in batches:
+            # 同一批次内并行执行，取最长 tile 时间
+            if not batch:
+                continue
+            batch_cycles = 0
+            for (m_idx, n_idx, k_idx) in batch: #遍历整个batch（并行同一批次内的HBM tile）
+                # 越界保护（最后一片包含边界剩余块）
+                if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                    continue
+                tile = hbm_tiles[m_idx, n_idx, k_idx]
+                batch_cycles = max(batch_cycles, tile.compute_cycle_count)  # 取最长 HBM tile 执行时间
+            total_cycle_count += batch_cycles
 
         return total_cycle_count
 
@@ -1112,7 +1230,7 @@ class Matmul(Operator):
             )
             previous_batch_compute_cycle_count = 0
             active_l1_tile_list = []
-            for m, n, k in Matmul.generate_tile_loops(
+            for m, n, k in Matmul.generate_tile_loops( # 对L1 tile的循环顺序进行遍历
                 ceil(M / l1_tile_M),
                 ceil(N / l1_tile_N),
                 ceil(K / l1_tile_K),
@@ -1244,6 +1362,11 @@ class Matmul(Operator):
             self.M = M
             self.N = N
             self.K = K
+            self.data_type = data_type
+            self.Stacked_Mapping = Stacked_Mapping
+            self.pcb_module = pcb_module
+            self.look_up_table = look_up_table
+            # 在初始化时计算执行周期数
             self.compute_cycle_count = self.simulate_hbm_tile_compute_cycle_count(
                 M, N, K, data_type, Stacked_Mapping, pcb_module, look_up_table
             )
@@ -1269,10 +1392,12 @@ class Matmul(Operator):
             N_remain = N % core_tile_N
             K_remain = K % core_tile_K
 
+            # 创建一个三维数组，将HBM tile中的每一个子矩阵乘作为一个对象，类型是CoreTileSimulator
             core_tiles = np.empty(
                 [ceil(M / core_tile_M), ceil(N / core_tile_N), ceil(K / core_tile_K)],
                 dtype=Matmul.CoreTileSimulator,
             )
+            # 对每个HBM tile中的每个core tile进行初始化
             if M_core_t * N_core_t * K_core_t != 0:
                 core_tiles[:M_core_t, :N_core_t, :K_core_t] = Matmul.CoreTileSimulator(
                     core_tile_M,
@@ -1354,13 +1479,8 @@ class Matmul(Operator):
                     look_up_table,
                 )
             
-
-
-            
-            
-            
-
-            # ?从这里开始往下不太确定需不需要修改，先照L2 Tile的方式写着
+            # //从这里开始往下应该是core_tile的运算部分，不太确定需不需要修改，先照L2 Tile的方式写着
+            # 计算每个 core tile 的 M_K, K_N, M_N 矩阵大小
             M_K_tile_size = np.zeros(
                 [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=int
             )
@@ -1393,140 +1513,240 @@ class Matmul(Operator):
                 M_N_tile_size[:M_core_t, -1] = core_tile_M * N_remain
             if M_remain > 0 and N_remain > 0:
                 M_N_tile_size[-1, -1] = M_remain * N_remain
+            # todo:从这里往下进行了大幅度的修改，需要重点检查
 
+            # 支持可配置的 m channel - n core 架构
+            # 从 device 读取配置：假设 channel_count 和 core_count 定义在 compute_module 中
+            # 如果 compute_module 中有 channel_count，则 cores_per_channel = core_count / channel_count
+            # //目前在device中还不存在channel_count的定义
+            # //todo:添加 channel_count 属性到 Device 类中
+            # channel_count在memory_module中
+            # 否则假设单 channel，cores_per_channel = core_count
+            total_core_count = pcb_module.compute_module.core_count
+            channel_count = getattr(pcb_module.memory_module.channel_count, 'channel_count', 1)             
+            cores_per_channel = total_core_count // channel_count if channel_count > 0 else total_core_count
+            
             total_cycle_count = 0
-            previous_batch_Read_M_K = np.zeros(
-                [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
-            )
-            previous_batch_Read_K_N = np.zeros(
-                [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
-            )
-            previous_batch_Read_M_N = np.zeros(
-                [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
-            )
-            previous_batch_Write_M_N = np.zeros(
-                [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
-            )
-            previous_batch_compute_cycle_count = 0
-            active_core_tile_list = []
-            # !这一块应该不太对，HBM Tile层级不考虑mnk的循环顺序，每个HBM Tile之间是并行关系
-            for m, n, k in Matmul.generate_tile_loops(
-                ceil(M / core_tile_M),
-                ceil(N / core_tile_N),
-                ceil(K / core_tile_K),
-                Stacked_Mapping.core_loop_order,
-            ):
+            
+            # 根据每个 channel 的 core 数量决定并行度
+            if cores_per_channel == 1:
+                # *单核模式：完全串行，保留数据重用
+                # 读取第一个 core tile 的数据
+                total_cycle_count += ceil(
+                    (M_K_tile_size[0, 0] + K_N_tile_size[0, 0])
+                    * data_type.word_size
+                    / pcb_module.compute_module.channel_bandwidth_per_cycle
+                )
                 
-                active_core_tile_list.append((m, n, k, core_tiles[m, n, k]))
-                if (
-                    m == ceil(M / core_tile_M) - 1
-                    and n == ceil(N / core_tile_N) - 1
-                    and k == ceil(K / core_tile_K) - 1
+                previous_m = 0
+                previous_n = 0
+                previous_k = 0
+                
+                for m, n, k in Matmul.generate_tile_loops(
+                    ceil(M / core_tile_M),
+                    ceil(N / core_tile_N),
+                    ceil(K / core_tile_K),
+                    Stacked_Mapping.core_loop_order,
                 ):
-                    pass
-                elif (
-                    len(active_core_tile_list)
-                    < pcb_module.compute_module.core_count
-                ):
-                    continue
-
-                assert (
-                    len(active_core_tile_list)
-                    <= pcb_module.compute_module.core_count
-                )
-                current_batch_Read_M_K = np.zeros(
-                    [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
-                )
-                current_batch_Read_K_N = np.zeros(
-                    [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
-                )
-                current_batch_Read_M_N = np.zeros(
-                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
-                )
-                current_batch_Write_M_N = np.zeros(
-                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
-                )
-
-                current_batch_compute_cycle_count = 0
-                for i in range(len(active_core_tile_list)):
-                    temp_m, temp_n, temp_k, temp_core_tile = active_core_tile_list[i]
-                    current_batch_Read_M_K[temp_m, temp_k] = 1
-                    current_batch_Read_K_N[temp_k, temp_n] = 1
-                    current_batch_Read_M_N[temp_m, temp_n] = temp_k > 0
-                    current_batch_Write_M_N[temp_m, temp_n] = 1
-                    temp_core_tile_compute_cycle_count = temp_core_tile.compute_cycle_count
-                    if temp_k > 0:
-                        temp_core_tile_compute_cycle_count += ceil(
-                            temp_core_tile.M
-                            * temp_core_tile.N
+                    # 跳过第一个 core tile的执行阶段
+                    if m == 0 and n == 0 and k == 0:
+                        continue
+                    
+                    core_tile = core_tiles[m, n, k]
+                    previous_core_tile = core_tiles[previous_m, previous_n, previous_k]
+                    
+                    current_tile_read_cycle_count = 0
+                    if m != previous_m or k != previous_k:
+                        current_tile_read_cycle_count += ceil(
+                            M_K_tile_size[m, k]
+                            * data_type.word_size
+                            / pcb_module.compute_module.channel_bandwidth_per_cycle
+                        )
+                    if k != previous_k or n != previous_n:
+                        current_tile_read_cycle_count += ceil(
+                            K_N_tile_size[k, n]
+                            * data_type.word_size
+                            / pcb_module.compute_module.channel_bandwidth_per_cycle
+                        )
+                    if k > 0 and (m != previous_m or n != previous_n):
+                        current_tile_read_cycle_count += ceil(
+                            M_N_tile_size[m, n]
+                            * data_type.word_size
+                            / pcb_module.compute_module.channel_bandwidth_per_cycle
+                        )
+                    
+                    previous_tile_compute_cycle_count = previous_core_tile.compute_cycle_count
+                    if previous_k > 0:
+                        previous_tile_compute_cycle_count += ceil(
+                            previous_core_tile.M
+                            * previous_core_tile.N
                             / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
                         )
-                    current_batch_compute_cycle_count = max(
-                        current_batch_compute_cycle_count,
-                        temp_core_tile_compute_cycle_count,
+                    
+                    if m == previous_m and n == previous_n:
+                        previous_tile_write_cycle_count = 0
+                    else:
+                        previous_tile_write_cycle_count = ceil(
+                            M_N_tile_size[previous_m, previous_n]
+                            * data_type.word_size
+                            / pcb_module.compute_module.channel_bandwidth_per_cycle #更换计算目标矩阵时写回数据到HBM中
+                        )
+                    
+                    total_cycle_count += (
+                        max(
+                            current_tile_read_cycle_count,
+                            previous_tile_compute_cycle_count,
+                        )
+                        + previous_tile_write_cycle_count
                     )
-
-                # if one output tile in this batch shares input/output with another output tile in the previous batch, assign them to the same core to avoid data movement
-                # note that of the three input matrix mk, kn, mn, at most one of them can be the same if we change m,n,k
-                current_batch_M_K_read_count = np.sum(
-                    (current_batch_Read_M_K * (~previous_batch_Read_M_K))
-                    * M_K_tile_size
-                )
-                current_batch_K_N_read_count = np.sum(
-                    (current_batch_Read_K_N * (~previous_batch_Read_K_N))
-                    * K_N_tile_size
-                )
-                current_batch_M_N_read_count = np.sum(
-                    (
-                        current_batch_Read_M_N
-                        * (~(previous_batch_Read_M_N + previous_batch_Write_M_N))
+                    
+                    previous_m = m
+                    previous_n = n
+                    previous_k = k
+                
+                last_core_tile = core_tiles[previous_m, previous_n, previous_k]
+                last_tile_compute_cycle_count = last_core_tile.compute_cycle_count
+                if previous_k > 0:
+                    last_tile_compute_cycle_count += ceil(
+                        last_core_tile.M
+                        * last_core_tile.N
+                        / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
                     )
-                    * M_N_tile_size
-                )
-                previous_batch_M_N_write_count = np.sum(
-                    (previous_batch_Write_M_N * (~current_batch_Read_M_N))
-                    * M_N_tile_size
-                )
-
-                # read current batch while compute and write previous batch 流水线处理
-                current_batch_read_count = (
-                    current_batch_M_K_read_count
-                    + current_batch_K_N_read_count
-                    + current_batch_M_N_read_count
-                )
-                current_batch_read_cycle_count = ceil(
-                    current_batch_read_count
-                    * pcb_module.compute_module.core.systolic_array.input_word_size
+                last_tile_write_cycle_count = ceil(
+                    M_N_tile_size[previous_m, previous_n]
+                    * data_type.word_size
                     / pcb_module.compute_module.channel_bandwidth_per_cycle
                 )
-                prvious_batch_write_cycle_count = ceil(
-                    previous_batch_M_N_write_count
-                    * pcb_module.compute_module.core.systolic_array.output_word_size
-                    / pcb_module.compute_module.channel_bandwidth_per_cycle
+                total_cycle_count += last_tile_compute_cycle_count + last_tile_write_cycle_count
+            
+            else:
+                # *多核模式：批量并行执行，保留数据重用，基本复用了L2 Tile中对L1tile的遍历逻辑
+                previous_batch_Read_M_K = np.zeros(
+                    [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
                 )
-
-                total_cycle_count += (
-                    max(
-                        current_batch_read_cycle_count,
-                        previous_batch_compute_cycle_count,
-                    )
-                    + prvious_batch_write_cycle_count
+                previous_batch_Read_K_N = np.zeros(
+                    [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
                 )
-
-                previous_batch_compute_cycle_count = current_batch_compute_cycle_count
-                previous_batch_Read_M_K = copy.deepcopy(current_batch_Read_M_K)
-                previous_batch_Read_K_N = copy.deepcopy(current_batch_Read_K_N)
-                previous_batch_Read_M_N = copy.deepcopy(current_batch_Read_M_N)
-                previous_batch_Write_M_N = copy.deepcopy(current_batch_Write_M_N)
-
+                previous_batch_Read_M_N = np.zeros(
+                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                )
+                previous_batch_Write_M_N = np.zeros(
+                    [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                )
+                previous_batch_compute_cycle_count = 0
                 active_core_tile_list = []
-
-            # last batch's compute and write
-            total_cycle_count += previous_batch_compute_cycle_count + ceil(
-                np.sum(previous_batch_Write_M_N * M_N_tile_size)
-                * data_type.word_size
-                / pcb_module.compute_module.channel_bandwidth_per_cycle
-            )
+                
+                for m, n, k in Matmul.generate_tile_loops(
+                    ceil(M / core_tile_M),
+                    ceil(N / core_tile_N),
+                    ceil(K / core_tile_K),
+                    Stacked_Mapping.core_loop_order,
+                ):
+                    active_core_tile_list.append((m, n, k, core_tiles[m, n, k]))
+                    
+                    # 当累积到 cores_per_channel 个 tile 或到达最后一个 tile 时，处理这一批
+                    if (
+                        m == ceil(M / core_tile_M) - 1
+                        and n == ceil(N / core_tile_N) - 1
+                        and k == ceil(K / core_tile_K) - 1
+                    ):
+                        pass  # 最后一个 tile，强制处理
+                    elif len(active_core_tile_list) < cores_per_channel:
+                        continue  # 还没凑够一批
+                    
+                    assert len(active_core_tile_list) <= cores_per_channel
+                    
+                    current_batch_Read_M_K = np.zeros(
+                        [ceil(M / core_tile_M), ceil(K / core_tile_K)], dtype=bool
+                    )
+                    current_batch_Read_K_N = np.zeros(
+                        [ceil(K / core_tile_K), ceil(N / core_tile_N)], dtype=bool
+                    )
+                    current_batch_Read_M_N = np.zeros(
+                        [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                    )
+                    current_batch_Write_M_N = np.zeros(
+                        [ceil(M / core_tile_M), ceil(N / core_tile_N)], dtype=bool
+                    )
+                    
+                    current_batch_compute_cycle_count = 0
+                    for i in range(len(active_core_tile_list)):
+                        temp_m, temp_n, temp_k, temp_core_tile = active_core_tile_list[i]
+                        current_batch_Read_M_K[temp_m, temp_k] = 1
+                        current_batch_Read_K_N[temp_k, temp_n] = 1
+                        current_batch_Read_M_N[temp_m, temp_n] = temp_k > 0
+                        current_batch_Write_M_N[temp_m, temp_n] = 1
+                        temp_core_tile_compute_cycle_count = temp_core_tile.compute_cycle_count
+                        if temp_k > 0:
+                            temp_core_tile_compute_cycle_count += ceil(
+                                temp_core_tile.M
+                                * temp_core_tile.N
+                                / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
+                            )
+                        current_batch_compute_cycle_count = max(
+                            current_batch_compute_cycle_count,
+                            temp_core_tile_compute_cycle_count,
+                        )
+                    
+                    # 计算数据重用后的实际读写量
+                    current_batch_M_K_read_count = np.sum(
+                        (current_batch_Read_M_K * (~previous_batch_Read_M_K))
+                        * M_K_tile_size
+                    )
+                    current_batch_K_N_read_count = np.sum(
+                        (current_batch_Read_K_N * (~previous_batch_Read_K_N))
+                        * K_N_tile_size
+                    )
+                    current_batch_M_N_read_count = np.sum(
+                        (
+                            current_batch_Read_M_N
+                            * (~(previous_batch_Read_M_N + previous_batch_Write_M_N))
+                        )
+                        * M_N_tile_size
+                    )
+                    previous_batch_M_N_write_count = np.sum(
+                        (previous_batch_Write_M_N * (~current_batch_Read_M_N))
+                        * M_N_tile_size
+                    )
+                    # read current batch while compute and write previous batch 流水线处理
+                    current_batch_read_count = (
+                        current_batch_M_K_read_count
+                        + current_batch_K_N_read_count
+                        + current_batch_M_N_read_count
+                    )
+                    current_batch_read_cycle_count = ceil(
+                        current_batch_read_count
+                        * pcb_module.compute_module.core.systolic_array.input_word_size
+                        / pcb_module.compute_module.channel_bandwidth_per_cycle
+                    )
+                    prvious_batch_write_cycle_count = ceil(
+                        previous_batch_M_N_write_count
+                        * pcb_module.compute_module.core.systolic_array.output_word_size
+                        / pcb_module.compute_module.channel_bandwidth_per_cycle
+                    )
+                    
+                    total_cycle_count += (
+                        max(
+                            current_batch_read_cycle_count,
+                            previous_batch_compute_cycle_count,
+                        )
+                        + prvious_batch_write_cycle_count
+                    )
+                    
+                    previous_batch_compute_cycle_count = current_batch_compute_cycle_count
+                    previous_batch_Read_M_K = copy.deepcopy(current_batch_Read_M_K)
+                    previous_batch_Read_K_N = copy.deepcopy(current_batch_Read_K_N)
+                    previous_batch_Read_M_N = copy.deepcopy(current_batch_Read_M_N)
+                    previous_batch_Write_M_N = copy.deepcopy(current_batch_Write_M_N)
+                    
+                    active_core_tile_list = []
+                
+                # 最后一批的计算和写回
+                total_cycle_count += previous_batch_compute_cycle_count + ceil(
+                    np.sum(previous_batch_Write_M_N * M_N_tile_size)
+                    * data_type.word_size
+                    / pcb_module.compute_module.channel_bandwidth_per_cycle
+                )
 
             return total_cycle_count
 
@@ -1598,7 +1818,7 @@ class Matmul(Operator):
 
             return compute_cycle_count
     
-    # ! Core Tile Simulator需要添加对于输入矩阵的位置的判定，后续考虑接入NoC的模拟器
+    # *Core Tile Simulator需要添加对于输入矩阵的位置的判定，后续考虑接入NoC的模拟器
     class CoreTileSimulator:
         def __init__(
             self,
