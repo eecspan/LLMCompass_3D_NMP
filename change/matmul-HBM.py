@@ -317,7 +317,7 @@ class Matmul(Operator):
         M_tiles: int,
         N_tiles: int,
         K_tiles: int,
-        core_count: int,
+        channel_count: int,
         schedule: str = "diagonal-channel", #暂时先考虑对角线调度
         custom_batches: Optional["List[List[Tuple[int,int,int]]]"] = None,
     ) -> "List[List[Tuple[int,int,int]]]":
@@ -326,9 +326,9 @@ class Matmul(Operator):
         同一批次内的 tile 视为并行执行，批次时长取该批次内最长 tile 时长。
 
         预置策略：
-        - row-major: 先按 k，从小到大；k 固定时按 m 行、n 列扫描，将每批最多 core_count 个 tile 打包。
+        - row-major: 先按 k，从小到大；k 固定时按 m 行、n 列扫描，将每批最多 channel_count 个 tile 打包。
         - col-major: 与上类似，但 n 优先。
-        - diagonal: 对 (m, n) 网格按反对角线 (m+n = 常数) 切片，每片最多 core_count 个。
+        - diagonal: 对 (m, n) 网格按反对角线 (m+n = 常数) 切片，每片最多 channel_count 个。
         - diagonal-channel: 针对 M_tiles == N_tiles 的“对角移位”调度；
           第 b 批为 core c 分配 (m=c, n=(c+b)%N_tiles, k=0)。若 K_tiles>1，则对每个 k 顺序重复该模式。
         - custom: 使用 custom_batches 直接指定批次。
@@ -349,7 +349,7 @@ class Matmul(Operator):
                 for m in range(M_tiles):
                     for n in range(N_tiles):
                         flat.append((m, n, k))
-                batches.extend(chunk(flat, core_count))
+                batches.extend(chunk(flat, channel_count))
             return batches
 
         if schedule == "col-major":
@@ -358,7 +358,7 @@ class Matmul(Operator):
                 for n in range(N_tiles):
                     for m in range(M_tiles):
                         flat.append((m, n, k))
-                batches.extend(chunk(flat, core_count))
+                batches.extend(chunk(flat, channel_count))
             return batches
 
         if schedule == "diagonal":
@@ -371,21 +371,21 @@ class Matmul(Operator):
                     for m in range(m_start, m_end + 1):
                         n = s - m
                         diag.append((m, n, k))
-                    batches.extend(chunk(diag, core_count))
+                    batches.extend(chunk(diag, channel_count))
             return batches
 
         if schedule == "diagonal-channel":
-            # 针对“对角运算”需求；要求 M_tiles 与 N_tiles 至少覆盖 core_count
+            # 针对“对角运算”需求；要求 M_tiles 与 N_tiles 至少覆盖 channel_count
             # k 维度顺序执行；每个 k 上进行 B = max(M_tiles, N_tiles) 个批次
-            C = min(M_tiles, N_tiles)
-            if C == 0:
-                return []
-            B = max(M_tiles, N_tiles)
+            # C = min(M_tiles, N_tiles)
+            # if C == 0:
+            #     return []
+            # B = max(M_tiles, N_tiles)
             for k in range(K_tiles):
-                for b in range(B):
+                for b in range(channel_count): # b 表示第 b 批，即相对于对角线的偏移量
                     batch: List[Tuple[int,int,int]] = []
                     # 为每个 core 分配一个 (m, n)
-                    for c in range(min(core_count, C)):
+                    for c in range(channel_count): # c 表示 core 的编号
                         m = c % M_tiles
                         n = (c + b) % N_tiles
                         batch.append((m, n, k))
@@ -399,7 +399,7 @@ class Matmul(Operator):
             for m in range(M_tiles):
                 for n in range(N_tiles):
                     flat.append((m, n, k))
-            batches.extend(chunk(flat, core_count))
+            batches.extend(chunk(flat, channel_count))
         return batches
 
     def compile_and_simulate(  #核心功能是遍历生成mapping
@@ -523,9 +523,9 @@ class Matmul(Operator):
                                                     min_cycle_count = cycle_count
                                                     best_mapping = mapping
         elif compile_mode == "3D_stacked":
-            HBM_tile_M_log2 = ceil(log2(self.computational_graph.M / pcb_module.compute_module.core_count)) #每个HBM tile的M维度大小为五等分+1的二的次方，最后的多余部分采用remain进行单独计算
-            HBM_tile_N_log2 = ceil(log2(self.computational_graph.N / pcb_module.compute_module.core_count))
-            HBM_tile_K_log2 = ceil(log2(self.computational_graph.K))
+            HBM_tile_M_log2 = ceil(log2(self.computational_graph.M / pcb_module.memory_module.channel_count)) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
+            HBM_tile_N_log2 = ceil(log2(self.computational_graph.N / pcb_module.memory_module.channel_count))
+            HBM_tile_K_log2 = ceil(log2(self.computational_graph.K))#K维度暂时不进行切分
             HBM_TILE_M = 2 ** HBM_tile_M_log2
             HBM_TILE_N = 2 ** HBM_tile_N_log2
             HBM_TILE_K = 2 ** HBM_tile_K_log2
@@ -535,11 +535,11 @@ class Matmul(Operator):
                 + HBM_TILE_M * HBM_TILE_K
                 + HBM_TILE_M * HBM_TILE_N
             )
-            assert working_set_size <= pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count // self.data_type.word_size, "HBM tile size exceeds memory capacity"
+            assert working_set_size <= pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count // self.data_type.word_size, "HBM tile size exceeds memory capacity"
             
             if (
                 working_set_size
-                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count)
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count)
                 // self.data_type.word_size
                 // 2
             ):
@@ -881,7 +881,8 @@ class Matmul(Operator):
         #                              ].item())
         # print('sdfsdfsdfsd')
         # exit()
-
+        
+        #总矩阵大小
         M = computational_graph.M
         N = computational_graph.N
         K = computational_graph.K
@@ -894,19 +895,20 @@ class Matmul(Operator):
         if stacked_mapping.HBM_double_buffering:
             assert (
                 HBM_tile_M * HBM_tile_N + HBM_tile_N * HBM_tile_K + HBM_tile_M * HBM_tile_K
-                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count) // self.data_type.word_size // 2
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count) // self.data_type.word_size // 2
             )
         else:
             assert (
                 HBM_tile_M * HBM_tile_N + HBM_tile_N * HBM_tile_K + HBM_tile_M * HBM_tile_K
-                <= (pcb_module.memory_module.memory_capacity / pcb_module.compute_module.core_count) // self.data_type.word_size
+                <= (pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count) // self.data_type.word_size
             )
 
         
         M_HBM_t = M // HBM_tile_M
         N_HBM_t = N // HBM_tile_N
         K_HBM_t = K // HBM_tile_K 
-        # TODO:这里的K维度切分可能需要修改,因为选择的HBM tile的K维度基本大于实际的K维度，而实际不打算对K维度进行切分
+        # //这里的K维度切分可能需要修改,因为选择的HBM tile的K维度基本大于实际的K维度，而实际不打算对K维度进行切分
+        # 经过检查应该不需要修改，可以在K_remain里被正确的初始化
         M_remain = M % HBM_tile_M
         N_remain = N % HBM_tile_N
         K_remain = K % HBM_tile_K
@@ -1000,13 +1002,13 @@ class Matmul(Operator):
         total_cycle_count = 0
 
         
-        # *生成批次调度
-        core_count = pcb_module.compute_module.core_count
+        # *生成批次调度,采用channel_count个通道并行处理
+        channel_count = pcb_module.memory_module.channel_count
         batches = self.generate_hbm_batches(
             M_tiles=ceil(M / HBM_tile_M),
             N_tiles=ceil(N / HBM_tile_N),
             K_tiles=ceil(K / HBM_tile_K),
-            core_count=core_count,
+            channel_count=channel_count,
             schedule=getattr(stacked_mapping, "hbm_schedule", "row-major"),
             custom_batches=getattr(stacked_mapping, "custom_batches", None),
         )
@@ -1520,10 +1522,10 @@ class Matmul(Operator):
             # 如果 compute_module 中有 channel_count，则 cores_per_channel = core_count / channel_count
             # //目前在device中还不存在channel_count的定义
             # //todo:添加 channel_count 属性到 Device 类中
-            # channel_count在memory_module中
+            # *channel_count在memory_module中
             # 否则假设单 channel，cores_per_channel = core_count
             total_core_count = pcb_module.compute_module.core_count
-            channel_count = getattr(pcb_module.memory_module.channel_count, 'channel_count', 1)             
+            channel_count = pcb_module.memory_module.channel_count             
             cores_per_channel = total_core_count // channel_count if channel_count > 0 else total_core_count
             
             total_cycle_count = 0
