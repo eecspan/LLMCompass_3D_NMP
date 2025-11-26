@@ -61,12 +61,15 @@ class BatchedMatmul(Operator):
         matmul_latency1 = (
             matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
         )
-
+        
+        print(f"#1 Matmul latency per batch: {matmul_latency1/self.bs*1e3:.4f} ms, Total latency for {self.bs} batches: {matmul_latency1*1e3:.4f} ms")
+        
         # 策略2：将批量矩阵乘法作为一个整体进行处理 
         matmul = Matmul(self.data_type)
         _ = matmul(
             Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
         )
+        # todo:latency2的后半部分的数据读取的延迟需要修改为HBM架构
         matmul_latency2 = (
             matmul.compile_and_simulate(pcb_module, compile_mode)
             + (self.bs - 1)
@@ -75,6 +78,9 @@ class BatchedMatmul(Operator):
             * self.data_type.word_size
             / pcb_module.io_module.bandwidth
         )
+        
+        print(f"#2 Matmul latency treating batch as whole: {matmul_latency2*1e3:.4f} ms")
+        
         # 选择两种策略中latency较小的作为最终结果
         self.latency = min(matmul_latency1, matmul_latency2)
         return self.latency
@@ -220,48 +226,7 @@ class Matmul(Operator):
                 f"M: {self.M}, N: {self.N}, K: {self.K}, word_size(B): {self.data_type.word_size}"
             )
 
-    class Mapping:
-        def __init__(
-            self,
-            l2_tile_M: int,
-            l2_tile_N: int,
-            l2_tile_K: int,
-            is_l2_double_buffering: bool,
-            l1_tile_M: int,
-            l1_tile_N: int,
-            l1_tile_K: int,
-            l2_loop_order: str,
-            l1_loop_order: str,
-            l0_M_tiling_factor: int,
-            l0_N_tiling_factor: int,
-            l0_K_tiling_factor: int,
-            dataflow: str = "os",
-        ):
-            self.l2_tile_M = l2_tile_M
-            self.l2_tile_N = l2_tile_N
-            self.l2_tile_K = l2_tile_K
-            self.is_l2_double_buffering = is_l2_double_buffering
-            self.l1_tile_M = l1_tile_M
-            self.l1_tile_N = l1_tile_N
-            self.l1_tile_K = l1_tile_K
-            self.l2_loop_order = l2_loop_order
-            self.l1_loop_order = l1_loop_order
-            self.l0_M_tiling_factor = l0_M_tiling_factor
-            self.l0_N_tiling_factor = l0_N_tiling_factor
-            self.l0_K_tiling_factor = l0_K_tiling_factor
-            self.dataflow = dataflow
-
-        def display(self):
-            print(f'{"-"*10} Mapping {"-"*10}')
-            print(
-                f"l2_tile_M: {self.l2_tile_M}, l2_tile_N: {self.l2_tile_N}, l2_tile_K: {self.l2_tile_K}, is_l2_double_buffering: {self.is_l2_double_buffering}, l2_loop_order: {self.l2_loop_order}"
-            )
-            print(
-                f"l1_tile_M: {self.l1_tile_M}, l1_tile_N: {self.l1_tile_N}, l1_tile_K: {self.l1_tile_K}, l1_loop_order: {self.l1_loop_order}"
-            )
-            print(
-                f"l0_M_tiling_factor: {self.l0_M_tiling_factor}, l0_N_tiling_factor: {self.l0_N_tiling_factor}, l0_K_tiling_factor: {self.l0_K_tiling_factor}"
-            )
+    
     
     class Stacked_Mapping:
         def __init__(
@@ -280,7 +245,7 @@ class Matmul(Operator):
             l0_K_tiling_factor: int,
             dataflow: str = "os",
             # 新增：HBM 批次调度策略
-            hbm_schedule: str = "diagonal",  # 可选: row-major | col-major | diagonal | diagonal-channel | custom
+            hbm_schedule: str = "diagonal-channel",  # 暂时先考虑对角线调度，可选: row-major | col-major | diagonal | diagonal-channel | custom
             custom_batches: Optional["List[List[Tuple[int,int,int]]]"] = None,  # 若 hbm_schedule == custom，则使用该批次定义
         ):
             self.HBM_tile_M = HBM_tile_M
@@ -318,13 +283,12 @@ class Matmul(Operator):
         N_tiles: int,
         K_tiles: int,
         channel_count: int,
-        schedule: str = "diagonal-channel", #暂时先考虑对角线调度
+        schedule: str,
         custom_batches: Optional["List[List[Tuple[int,int,int]]]"] = None,
     ) -> "List[List[Tuple[int,int,int]]]":
         """生成分批执行的 HBM tile 列表。
         返回值为批次列表；每个批次是 (m_idx, n_idx, k_idx) 元组的列表；
         同一批次内的 tile 视为并行执行，批次时长取该批次内最长 tile 时长。
-
         预置策略：
         - row-major: 先按 k，从小到大；k 固定时按 m 行、n 列扫描，将每批最多 channel_count 个 tile 打包。
         - col-major: 与上类似，但 n 优先。
@@ -405,8 +369,22 @@ class Matmul(Operator):
     def compile_and_simulate(  #核心功能是遍历生成mapping
         self,
         pcb_module: Device,
-        compile_mode: str = "exhaustive",
+        compile_mode: str = "3D_stacked",
     ):
+        print(f"\n{'='*70}")
+        print(f"Starting compile_and_simulate - Mode: {compile_mode}")
+        print(f"{'='*70}")
+        print(f"Computational Graph: M={self.computational_graph.M}, N={self.computational_graph.N}, K={self.computational_graph.K}")
+        print(f"Device Configuration:")
+        print(f"  - device name: {pcb_module}")
+        print(f"  - Core count: {pcb_module.compute_module.core_count}")
+        print(f"  - Memory Channels: {pcb_module.memory_module.channel_count}")
+        print(f"  - Memory Capacity per Channel: {pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count / 1024 / 1024 / 1024:.2f} GB")
+        print(f"  - Core SRAM: {pcb_module.compute_module.core.SRAM_size / 1024:.1f} KB")
+        print(f"  - Systolic Array: {pcb_module.compute_module.core.systolic_array.array_height}x{pcb_module.compute_module.core.systolic_array.array_width}")
+        print(f"  - Channel Bandwidth: {pcb_module.compute_module.channel_bandwidth_per_cycle} B/cycle")
+        print(f"{'='*70}\n")
+        
         min_cycle_count = 2**63 - 1
         best_mapping = None
         best_stacked_mapping = None
@@ -431,98 +409,7 @@ class Matmul(Operator):
         #         compute_latency, io_latency
         #     )  # + pcb_module.io_module.latency * 2
         #     return self.latency
-        if compile_mode == "exhaustive":
-            for l2_tile_M_log2 in range(5, ceil(log2(self.computational_graph.M)) + 1): #上面都用M了这里又写graph.m，怪
-                l2_tile_M = 2**l2_tile_M_log2
-                for l2_tile_N_log2 in range(
-                    5, ceil(log2(self.computational_graph.N)) + 1
-                ):
-                    l2_tile_N = 2**l2_tile_N_log2
-                    for l2_tile_K_log2 in range(
-                        5, ceil(log2(self.computational_graph.K)) + 1
-                    ):
-                        l2_tile_K = 2**l2_tile_K_log2
-                        working_set_size = (
-                            l2_tile_N * l2_tile_K
-                            + l2_tile_M * l2_tile_K
-                            + l2_tile_M * l2_tile_N
-                        )
-                        if (
-                            working_set_size
-                            > pcb_module.compute_module.l2_size
-                            // self.data_type.word_size
-                        ):
-                            continue
-                        elif (
-                            working_set_size
-                            <= pcb_module.compute_module.l2_size
-                            // self.data_type.word_size
-                            // 2
-                        ):
-                            is_l2_double_buffering = True
-                        else:
-                            is_l2_double_buffering = False
-                        for l1_tile_M_log2 in range(5, l2_tile_M_log2 + 1):
-                            l1_tile_M = 2**l1_tile_M_log2
-                            for l1_tile_N_log2 in range(5, l2_tile_N_log2 + 1):
-                                l1_tile_N = 2**l1_tile_N_log2
-                                for l1_tile_K_log2 in range(5, l2_tile_K_log2 + 1):
-                                    l1_tile_K = 2**l1_tile_K_log2
-                                    if (
-                                        l1_tile_M * l1_tile_N
-                                        + l1_tile_N * l1_tile_K
-                                        + l1_tile_M * l1_tile_K
-                                        > pcb_module.compute_module.core.SRAM_size
-                                        // self.data_type.word_size
-                                        // 2
-                                    ):
-                                        continue
-                                    for l2_loop_order in [
-                                        "mkn",
-                                        "mnk",
-                                        "nkm",
-                                        "nmk",
-                                        "knm",
-                                        "kmn",
-                                    ]:
-                                        for l1_loop_order in [
-                                            "mkn",
-                                            "mnk",
-                                            "nkm",
-                                            "nmk",
-                                            "knm",
-                                            "kmn",
-                                        ]:
-                                            for (
-                                                l0_M_tiling_factor,
-                                                l0_N_tiling_factor,
-                                                l0_K_tiling_factor,
-                                            ) in self.find_permutations(
-                                                pcb_module.compute_module.core.systolic_array_count
-                                            ):
-                                                mapping = self.Mapping(
-                                                    l2_tile_M,
-                                                    l2_tile_N,
-                                                    l2_tile_K,
-                                                    is_l2_double_buffering,
-                                                    l1_tile_M,
-                                                    l1_tile_N,
-                                                    l1_tile_K,
-                                                    l2_loop_order,
-                                                    l1_loop_order,
-                                                    l0_M_tiling_factor,
-                                                    l0_N_tiling_factor,
-                                                    l0_K_tiling_factor,
-                                                )
-                                                cycle_count = self.simulate( #核心在这里，调用simulate函数进行模拟
-                                                    self.computational_graph,
-                                                    mapping,
-                                                    pcb_module,
-                                                )
-                                                if cycle_count < min_cycle_count:
-                                                    min_cycle_count = cycle_count
-                                                    best_mapping = mapping
-        elif compile_mode == "3D_stacked":
+        if compile_mode == "3D_stacked":
             HBM_tile_M_log2 = ceil(log2(self.computational_graph.M / pcb_module.memory_module.channel_count)) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
             HBM_tile_N_log2 = ceil(log2(self.computational_graph.N / pcb_module.memory_module.channel_count))
             HBM_tile_K_log2 = ceil(log2(self.computational_graph.K))#K维度暂时不进行切分
@@ -535,6 +422,9 @@ class Matmul(Operator):
                 + HBM_TILE_M * HBM_TILE_K
                 + HBM_TILE_M * HBM_TILE_N
             )
+            print(f"HBM Tile Size: M={HBM_TILE_M}, N={HBM_TILE_N}, K={HBM_TILE_K}")
+            print(f"HBM Working Set Size: {working_set_size * self.data_type.word_size / 1024:.1f} KB per channel")
+            
             assert working_set_size <= pcb_module.memory_module.memory_capacity / pcb_module.memory_module.channel_count // self.data_type.word_size, "HBM tile size exceeds memory capacity"
             
             if (
@@ -546,6 +436,12 @@ class Matmul(Operator):
                 HBM_double_buffering = True
             else:
                 HBM_double_buffering = False
+            
+            print(f"HBM Double Buffering: {HBM_double_buffering}")
+            print(f"\nSearching optimal mapping configurations...")
+            
+            total_configs = 0
+            tested_configs = 0
             for core_tile_M_log2 in range(5, HBM_tile_M_log2 + 1):
                 core_tile_M = 2**core_tile_M_log2
                 for core_tile_N_log2 in range(5, HBM_tile_N_log2 + 1):
@@ -589,6 +485,11 @@ class Matmul(Operator):
                                     l0_N_tiling_factor,
                                     l0_K_tiling_factor,
                                 )
+                                tested_configs += 1
+                                if tested_configs % 50 == 0 or tested_configs == 1:
+                                    print(f"  Progress: tested {tested_configs} configs | Current best: {min_cycle_count / pcb_module.compute_module.clock_freq * 1000:.3f} ms")
+                                    print(f"    → Core tile: M={core_tile_M}, N={core_tile_N}, K={core_tile_K}, loop={core_loop_order}")
+                                
                                 cycle_count = self.stacked_simulate(
                                     self.computational_graph,
                                     stacked_mapping,
@@ -597,8 +498,21 @@ class Matmul(Operator):
                                 if cycle_count < min_cycle_count:
                                     min_cycle_count = cycle_count
                                     best_stacked_mapping = stacked_mapping
+                                    print(f"  ✓ New best found! Cycle count: {cycle_count}, Latency: {cycle_count / pcb_module.compute_module.clock_freq * 1000:.3f} ms")
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
+        
+        print(f"\n{'='*70}")
+        print(f"Optimization Complete!")
+        print(f"  - Total configurations tested: {tested_configs}")
+        print(f"  - Best cycle count: {min_cycle_count}")
+        print(f"  - Best latency: {min_cycle_count / pcb_module.compute_module.clock_freq * 1000:.3f} ms")
+        if best_stacked_mapping:
+            print(f"  - Best HBM tile: M={best_stacked_mapping.HBM_tile_M}, N={best_stacked_mapping.HBM_tile_N}, K={best_stacked_mapping.HBM_tile_K}")
+            print(f"  - Best core tile: M={best_stacked_mapping.core_tile_M}, N={best_stacked_mapping.core_tile_N}, K={best_stacked_mapping.core_tile_K}")
+            print(f"  - Loop order: {best_stacked_mapping.core_loop_order}")
+        print(f"{'='*70}\n")
+        
         self.best_mapping = best_mapping
         self.best_stacked_mapping = best_stacked_mapping
         # if self.best_mapping is not None:
@@ -609,238 +523,7 @@ class Matmul(Operator):
         # self.best_mapping.display()
         return self.latency
 
-    def simulate(
-        self,
-        computational_graph: ComputationalGraph,
-        mapping: Mapping,
-        pcb_module: Device,
-    ) -> int:
-        if self.look_up_table is None:
-            self.look_up_table = pd.read_csv(
-                f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
-                header=None,
-                names=[
-                    "M",
-                    "N",
-                    "K",
-                    "ArrayHeight",
-                    "ArrayWidth",
-                    "Dataflow",
-                    "cycle_count",
-                    "util_rate",
-                ],
-            )
-            self.look_up_table.drop_duplicates(
-                inplace=True,
-                subset=["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
-            )
-            # self.look_up_table.reset_index(drop=True, inplace=True)
-            # self.look_up_table.to_csv(
-            #     f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
-            #     header=False,
-            #     index=False,
-            # )
-            self.look_up_table.set_index(
-                ["M", "N", "K", "ArrayHeight", "ArrayWidth", "Dataflow"],
-                inplace=True,
-            )
-        # print(self.look_up_table)
-        # print(self.look_up_table.loc[(32, 16, 256, 16, 16, 'os'), "cycle_count"
-        #                              ].item())
-        # print('sdfsdfsdfsd')
-        # exit()
-        M = computational_graph.M
-        N = computational_graph.N
-        K = computational_graph.K
-        data_type = computational_graph.data_type
-
-        l2_tile_M = mapping.l2_tile_M
-        l2_tile_N = mapping.l2_tile_N
-        l2_tile_K = mapping.l2_tile_K
-
-        if mapping.is_l2_double_buffering:
-            assert (
-                l2_tile_M * l2_tile_N + l2_tile_N * l2_tile_K + l2_tile_M * l2_tile_K
-                <= pcb_module.compute_module.l2_size // self.data_type.word_size // 2
-            )
-        else:
-            assert (
-                l2_tile_M * l2_tile_N + l2_tile_N * l2_tile_K + l2_tile_M * l2_tile_K
-                <= pcb_module.compute_module.l2_size // self.data_type.word_size
-            )
-
-        M_l2_t = M // l2_tile_M
-        N_l2_t = N // l2_tile_N
-        K_l2_t = K // l2_tile_K
-        M_remain = M % l2_tile_M
-        N_remain = N % l2_tile_N
-        K_remain = K % l2_tile_K
-
-        l2_tiles = np.empty( #创建一个三维数组，用于存储L2 tile的模拟结果，类型是L2TileSimulator
-            [ceil(M / l2_tile_M), ceil(N / l2_tile_N), ceil(K / l2_tile_K)],
-            dtype=self.L2TileSimulator,
-        )
-        # print('-'*20)
-        # print(l2_tiles.shape)
-        if M_l2_t * N_l2_t * K_l2_t != 0:
-            l2_tiles[:M_l2_t, :N_l2_t, :K_l2_t] = self.L2TileSimulator(
-                l2_tile_M,
-                l2_tile_N,
-                l2_tile_K,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if M_remain != 0:
-            l2_tiles[-1, :N_l2_t, :K_l2_t] = self.L2TileSimulator(
-                M_remain,
-                l2_tile_N,
-                l2_tile_K,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if N_remain != 0:
-            l2_tiles[:M_l2_t, -1, :K_l2_t] = self.L2TileSimulator(
-                l2_tile_M,
-                N_remain,
-                l2_tile_K,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if K_remain != 0:
-            l2_tiles[:M_l2_t, :N_l2_t, -1] = self.L2TileSimulator(
-                l2_tile_M,
-                l2_tile_N,
-                K_remain,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if M_remain * N_remain != 0:
-            l2_tiles[-1, -1, :K_l2_t] = self.L2TileSimulator(
-                M_remain,
-                N_remain,
-                l2_tile_K,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if M_remain * K_remain != 0:
-            l2_tiles[-1, :N_l2_t, -1] = self.L2TileSimulator(
-                M_remain,
-                l2_tile_N,
-                K_remain,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if N_remain * K_remain != 0:
-            l2_tiles[:M_l2_t, -1, -1] = self.L2TileSimulator(
-                l2_tile_M,
-                N_remain,
-                K_remain,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-        if M_remain * N_remain * K_remain != 0:
-            l2_tiles[-1, -1, -1] = self.L2TileSimulator(
-                M_remain,
-                N_remain,
-                K_remain,
-                data_type,
-                mapping,
-                pcb_module,
-                self.look_up_table,
-            )
-
-        total_cycle_count = 0
-        total_cycle_count += (
-            l2_tiles[0, 0, 0].M_K_io_cycle_count + l2_tiles[0, 0, 0].K_N_io_cycle_count
-        )
-
-        previous_m = 0
-        previous_n = 0
-        previous_k = 0
-
-        for m, n, k in self.generate_tile_loops( #对L2 tile的循环顺序进行遍历
-            ceil(M / l2_tile_M),
-            ceil(N / l2_tile_N),
-            ceil(K / l2_tile_K),
-            mapping.l2_loop_order,
-        ):
-            if m == 0 and n == 0 and k == 0:
-                continue
-
-            l2_tile = l2_tiles[m, n, k]
-            previous_l2_tile = l2_tiles[previous_m, previous_n, previous_k]
-
-            # current tile read latency
-            if m == previous_m and k == previous_k:
-                current_tile_read_cycle_count = l2_tile.K_N_io_cycle_count
-            elif n == previous_n and k == previous_k:
-                current_tile_read_cycle_count = l2_tile.M_K_io_cycle_count
-            else:
-                current_tile_read_cycle_count = (
-                    l2_tile.M_K_io_cycle_count + l2_tile.K_N_io_cycle_count
-                )
-            
-            if k > 0 and not (m == previous_m and n == previous_n):
-                current_tile_read_cycle_count += l2_tile.M_N_io_cycle_count #读取一个新的C矩阵中的M*N矩阵
-            
-            # previous tile compute latency
-            previous_tile_compute_cycle_count = previous_l2_tile.compute_cycle_count
-            if k > 0:
-                previous_tile_compute_cycle_count += (
-                    previous_l2_tile.K_reduction_cycle_count
-                )
-            # previous tile write latency
-            if m == previous_m and n == previous_n:
-                previous_tile_write_cycle_count = 0 #不需要写回L2
-            else:
-                previous_tile_write_cycle_count = previous_l2_tile.M_N_io_cycle_count
-
-            # read current tile, compute previous tile, write previous tile
-            if mapping.is_l2_double_buffering:  # pipelined
-                total_cycle_count += (
-                    max(
-                        current_tile_read_cycle_count, previous_tile_compute_cycle_count
-                    )
-                    + previous_tile_write_cycle_count
-                )
-            else:  # non-pipelined
-                total_cycle_count += (
-                    current_tile_read_cycle_count
-                    + previous_tile_compute_cycle_count
-                    + previous_tile_write_cycle_count
-                )
-
-            previous_m = m
-            previous_n = n
-            previous_k = k
-
-        # compute and write last tile
-        total_cycle_count += (
-            l2_tiles[-1, -1, -1].M_N_io_cycle_count
-            + l2_tiles[-1, -1, -1].compute_cycle_count
-        )
-
-        if previous_k > 0:
-            total_cycle_count += ceil(l2_tiles[-1, -1, -1].K_reduction_cycle_count)
-
-        return total_cycle_count #+ ceil(
-        # pcb_module.io_module.latency * 2 * pcb_module.compute_module.clock_freq
-        # )
-
+    
     def stacked_simulate( #根据mapping进行任务分割
         self,
         computational_graph:ComputationalGraph,
@@ -1028,327 +711,7 @@ class Matmul(Operator):
 
         return total_cycle_count
 
-    class L2TileSimulator:
-        def __init__(
-            self,
-            M: int,
-            N: int,
-            K: int,
-            data_type: DataType,
-            mapping: "Matmul.Mapping",
-            pcb_module: Device,
-            look_up_table: pd.DataFrame,
-        ):
-            # print(f'L2 tile: {M} {N} {K}')
-            self.M = M
-            self.N = N
-            self.K = K
-            self.K_reduction_cycle_count = ceil(
-                M * N / pcb_module.compute_module.total_vector_flops_per_cycle
-            ) + 2 * ceil(
-                M
-                * N
-                * data_type.word_size
-                / pcb_module.compute_module.l2_bandwidth_per_cycle
-            )
-            self.K_reduction_io_count = 2 * M * N * data_type.word_size
-            self.M_K_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                M, K, data_type, pcb_module
-            )
-            self.K_N_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                K, N, data_type, pcb_module
-            )
-            self.M_N_io_cycle_count = self.simulate_l2_tile_io_cycle_count(
-                M, N, data_type, pcb_module
-            )
-            self.compute_cycle_count = self.simulate_l2_tile_compute_cycle_count(
-                M, N, K, data_type, mapping, pcb_module, look_up_table
-            )
-# //修改成从主存中读取数据到片上内存的周期数（好像不太对，近存算力应该是数据直接存core上的内存中）
-        def simulate_l2_tile_io_cycle_count(
-            self, M: int, N: int, data_type: DataType, chiplet_module: Device
-        ):
-            return ceil(    #向上取整
-                M
-                * N
-                * data_type.word_size
-                / (
-                    chiplet_module.io_module.bandwidth
-                    / chiplet_module.compute_module.clock_freq
-                )
-            )
-
-        def simulate_l2_tile_compute_cycle_count(
-            self,
-            M: int,
-            N: int,
-            K: int,
-            data_type: DataType,
-            mapping: "Matmul.Mapping",
-            chiplet_module: Device,
-            look_up_table: pd.DataFrame,
-        ) -> int:
-            l1_tile_M = mapping.l1_tile_M
-            l1_tile_N = mapping.l1_tile_N
-            l1_tile_K = mapping.l1_tile_K
-
-            M_l1_t = M // l1_tile_M
-            N_l1_t = N // l1_tile_N
-            K_l1_t = K // l1_tile_K
-            M_remain = M % l1_tile_M
-            N_remain = N % l1_tile_N
-            K_remain = K % l1_tile_K
-
-            l1_tiles = np.empty(
-                [ceil(M / l1_tile_M), ceil(N / l1_tile_N), ceil(K / l1_tile_K)],
-                dtype=Matmul.L1TileSimulator,
-            )
-            if M_l1_t * N_l1_t * K_l1_t != 0:
-                l1_tiles[:M_l1_t, :N_l1_t, :K_l1_t] = Matmul.L1TileSimulator(
-                    l1_tile_M,
-                    l1_tile_N,
-                    l1_tile_K,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if M_remain != 0:
-                l1_tiles[-1, :N_l1_t, :K_l1_t] = Matmul.L1TileSimulator(
-                    M_remain,
-                    l1_tile_N,
-                    l1_tile_K,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if N_remain != 0:
-                l1_tiles[:M_l1_t, -1, :K_l1_t] = Matmul.L1TileSimulator(
-                    l1_tile_M,
-                    N_remain,
-                    l1_tile_K,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if K_remain != 0:
-                l1_tiles[:M_l1_t, :N_l1_t, -1] = Matmul.L1TileSimulator(
-                    l1_tile_M,
-                    l1_tile_N,
-                    K_remain,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if M_remain * N_remain != 0:
-                l1_tiles[-1, -1, :K_l1_t] = Matmul.L1TileSimulator(
-                    M_remain,
-                    N_remain,
-                    l1_tile_K,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if M_remain * K_remain != 0:
-                l1_tiles[-1, :N_l1_t, -1] = Matmul.L1TileSimulator(
-                    M_remain,
-                    l1_tile_N,
-                    K_remain,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if N_remain * K_remain != 0:
-                l1_tiles[:M_l1_t, -1, -1] = Matmul.L1TileSimulator(
-                    l1_tile_M,
-                    N_remain,
-                    K_remain,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-            if M_remain * N_remain * K_remain != 0:
-                l1_tiles[-1, -1, -1] = Matmul.L1TileSimulator(
-                    M_remain,
-                    N_remain,
-                    K_remain,
-                    data_type,
-                    mapping,
-                    chiplet_module,
-                    look_up_table,
-                )
-
-            M_K_tile_size = np.zeros(
-                [ceil(M / l1_tile_M), ceil(K / l1_tile_K)], dtype=int
-            )
-            M_K_tile_size[:M_l1_t, :K_l1_t] = l1_tile_M * l1_tile_K
-            if M_remain > 0:
-                M_K_tile_size[-1, :K_l1_t] = M_remain * l1_tile_K
-            if K_remain > 0:
-                M_K_tile_size[:M_l1_t, -1] = l1_tile_M * K_remain
-            if M_remain > 0 and K_remain > 0:
-                M_K_tile_size[-1, -1] = M_remain * K_remain
-
-            K_N_tile_size = np.zeros(
-                [ceil(K / l1_tile_K), ceil(N / l1_tile_N)], dtype=int
-            )
-            K_N_tile_size[:K_l1_t, :N_l1_t] = l1_tile_K * l1_tile_N
-            if K_remain > 0:
-                K_N_tile_size[-1, :N_l1_t] = K_remain * l1_tile_N
-            if N_remain > 0:
-                K_N_tile_size[:K_l1_t, -1] = l1_tile_K * N_remain
-            if K_remain > 0 and N_remain > 0:
-                K_N_tile_size[-1, -1] = K_remain * N_remain
-
-            M_N_tile_size = np.zeros(
-                [ceil(M / l1_tile_M), ceil(N / l1_tile_N)], dtype=int
-            )
-            M_N_tile_size[:M_l1_t, :N_l1_t] = l1_tile_M * l1_tile_N
-            if M_remain > 0:
-                M_N_tile_size[-1, :N_l1_t] = M_remain * l1_tile_N
-            if N_remain > 0:
-                M_N_tile_size[:M_l1_t, -1] = l1_tile_M * N_remain
-            if M_remain > 0 and N_remain > 0:
-                M_N_tile_size[-1, -1] = M_remain * N_remain
-
-            total_cycle_count = 0
-            previous_batch_Read_M_K = np.zeros(
-                [ceil(M / l1_tile_M), ceil(K / l1_tile_K)], dtype=bool
-            )
-            previous_batch_Read_K_N = np.zeros(
-                [ceil(K / l1_tile_K), ceil(N / l1_tile_N)], dtype=bool
-            )
-            previous_batch_Read_M_N = np.zeros(
-                [ceil(M / l1_tile_M), ceil(N / l1_tile_N)], dtype=bool
-            )
-            previous_batch_Write_M_N = np.zeros(
-                [ceil(M / l1_tile_M), ceil(N / l1_tile_N)], dtype=bool
-            )
-            previous_batch_compute_cycle_count = 0
-            active_l1_tile_list = []
-            for m, n, k in Matmul.generate_tile_loops( # 对L1 tile的循环顺序进行遍历
-                ceil(M / l1_tile_M),
-                ceil(N / l1_tile_N),
-                ceil(K / l1_tile_K),
-                mapping.l1_loop_order,
-            ):
-                active_l1_tile_list.append((m, n, k, l1_tiles[m, n, k]))
-                if (
-                    m == ceil(M / l1_tile_M) - 1
-                    and n == ceil(N / l1_tile_N) - 1
-                    and k == ceil(K / l1_tile_K) - 1
-                ):
-                    pass
-                elif (
-                    len(active_l1_tile_list) < chiplet_module.compute_module.core_count
-                ):
-                    continue
-
-                assert (
-                    len(active_l1_tile_list) <= chiplet_module.compute_module.core_count
-                )
-                current_batch_Read_M_K = np.zeros(
-                    [ceil(M / l1_tile_M), ceil(K / l1_tile_K)], dtype=bool
-                )
-                current_batch_Read_K_N = np.zeros(
-                    [ceil(K / l1_tile_K), ceil(N / l1_tile_N)], dtype=bool
-                )
-                current_batch_Read_M_N = np.zeros(
-                    [ceil(M / l1_tile_M), ceil(N / l1_tile_N)], dtype=bool
-                )
-                current_batch_Write_M_N = np.zeros(
-                    [ceil(M / l1_tile_M), ceil(N / l1_tile_N)], dtype=bool
-                )
-
-                current_batch_compute_cycle_count = 0
-                for i in range(len(active_l1_tile_list)):
-                    temp_m, temp_n, temp_k, temp_l1_tile = active_l1_tile_list[i]
-                    current_batch_Read_M_K[temp_m, temp_k] = 1
-                    current_batch_Read_K_N[temp_k, temp_n] = 1
-                    current_batch_Read_M_N[temp_m, temp_n] = temp_k > 0
-                    current_batch_Write_M_N[temp_m, temp_n] = 1
-                    temp_l1_tile_compute_cycle_count = temp_l1_tile.compute_cycle_count
-                    if temp_k > 0:
-                        temp_l1_tile_compute_cycle_count += ceil(
-                            temp_l1_tile.M
-                            * temp_l1_tile.N
-                            / chiplet_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
-                        )
-                    current_batch_compute_cycle_count = max(
-                        current_batch_compute_cycle_count,
-                        temp_l1_tile_compute_cycle_count,
-                    )
-
-                # if one output tile in this batch shares input/output with another output tile in the previous batch, assign them to the same core to avoid data movement
-                # note that of the three input matrix mk, kn, mn, at most one of them can be the same if we change m,n,k
-                current_batch_M_K_read_count = np.sum(
-                    (current_batch_Read_M_K * (~previous_batch_Read_M_K)) #布尔矩阵相乘，是按位与，再与M_K_tile_size相乘得到当前batch需要读取的M_K_tile_size的总大小
-                    * M_K_tile_size
-                )
-                current_batch_K_N_read_count = np.sum(
-                    (current_batch_Read_K_N * (~previous_batch_Read_K_N))
-                    * K_N_tile_size
-                )
-                current_batch_M_N_read_count = np.sum(
-                    (
-                        current_batch_Read_M_N
-                        * (~(previous_batch_Read_M_N + previous_batch_Write_M_N))
-                    )
-                    * M_N_tile_size
-                )
-                previous_batch_M_N_write_count = np.sum(
-                    (previous_batch_Write_M_N * (~current_batch_Read_M_N))
-                    * M_N_tile_size
-                )
-
-                # read current batch while compute and write previous batch 流水线处理
-                current_batch_read_count = (
-                    current_batch_M_K_read_count
-                    + current_batch_K_N_read_count
-                    + current_batch_M_N_read_count
-                )
-                current_batch_read_cycle_count = ceil(
-                    current_batch_read_count
-                    * chiplet_module.compute_module.core.systolic_array.input_word_size
-                    / chiplet_module.compute_module.l2_bandwidth_per_cycle
-                )
-                prvious_batch_write_cycle_count = ceil(
-                    previous_batch_M_N_write_count
-                    * chiplet_module.compute_module.core.systolic_array.output_word_size
-                    / chiplet_module.compute_module.l2_bandwidth_per_cycle
-                )
-
-                total_cycle_count += (
-                    max(
-                        current_batch_read_cycle_count,
-                        previous_batch_compute_cycle_count,
-                    )
-                    + prvious_batch_write_cycle_count
-                )
-
-                previous_batch_compute_cycle_count = current_batch_compute_cycle_count
-                previous_batch_Read_M_K = copy.deepcopy(current_batch_Read_M_K)
-                previous_batch_Read_K_N = copy.deepcopy(current_batch_Read_K_N)
-                previous_batch_Read_M_N = copy.deepcopy(current_batch_Read_M_N)
-                previous_batch_Write_M_N = copy.deepcopy(current_batch_Write_M_N)
-
-                active_l1_tile_list = []
-
-            # last batch's compute and write
-            total_cycle_count += previous_batch_compute_cycle_count + ceil(
-                np.sum(previous_batch_Write_M_N * M_N_tile_size)
-                * data_type.word_size
-                / chiplet_module.compute_module.l2_bandwidth_per_cycle
-            )
-
-            return total_cycle_count
-
+    
     class HBMTileSimulator:
         def __init__(
             self,
@@ -1520,10 +883,8 @@ class Matmul(Operator):
             # 支持可配置的 m channel - n core 架构
             # 从 device 读取配置：假设 channel_count 和 core_count 定义在 compute_module 中
             # 如果 compute_module 中有 channel_count，则 cores_per_channel = core_count / channel_count
-            # //目前在device中还不存在channel_count的定义
-            # //todo:添加 channel_count 属性到 Device 类中
-            # *channel_count在memory_module中
-            # 否则假设单 channel，cores_per_channel = core_count
+            # channel_count在memory_module中
+            
             total_core_count = pcb_module.compute_module.core_count
             channel_count = pcb_module.memory_module.channel_count             
             cores_per_channel = total_core_count // channel_count if channel_count > 0 else total_core_count
@@ -1752,74 +1113,6 @@ class Matmul(Operator):
 
             return total_cycle_count
 
-            
-
-
-
-
-    class L1TileSimulator:
-        def __init__(
-            self,
-            M: int,
-            N: int,
-            K: int,
-            data_type: DataType,
-            mapping: "Matmul.Mapping",
-            chiplet_module: Device,
-            look_up_table: pd.DataFrame,
-        ):
-            # print(f'L1 tile: {M} {N} {K}')
-            self.M = M
-            self.N = N
-            self.K = K
-            self.compute_cycle_count = self.simulate_l1_tile_compute_cycle_count(
-                M, N, K, data_type, mapping, chiplet_module, look_up_table
-            )
-
-        def simulate_l1_tile_compute_cycle_count(
-            self,
-            M: int,
-            N: int,
-            K: int,
-            data_type: DataType,
-            mapping: "Matmul.Mapping",
-            chiplet_module: Device,
-            look_up_table: pd.DataFrame,
-        ):
-            assert (
-                M * K + K * N + M * N
-                <= chiplet_module.compute_module.core.SRAM_size
-                // data_type.word_size
-                // 2
-            )
-
-            M_tiling_factor = mapping.l0_M_tiling_factor
-            N_tiling_factor = mapping.l0_N_tiling_factor
-            K_tiling_factor = mapping.l0_K_tiling_factor
-            assert (
-                M_tiling_factor * K_tiling_factor * N_tiling_factor
-                <= chiplet_module.compute_module.core.systolic_array_count
-            )
-
-            compute_cycle_count = ceil(
-                Matmul.simulate_systolic_array_cycle_count(
-                    look_up_table,
-                    ceil(M / M_tiling_factor),
-                    ceil(N / N_tiling_factor),
-                    ceil(K / K_tiling_factor),
-                    chiplet_module.compute_module.core.systolic_array.array_height,
-                    chiplet_module.compute_module.core.systolic_array.array_width,
-                    chiplet_module.compute_module.core.systolic_array.mac_per_cycle,
-                    mapping.dataflow,
-                )
-                + (K_tiling_factor - 1)
-                * M
-                * N
-                / chiplet_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
-            )
-
-            return compute_cycle_count
-    
     # *Core Tile Simulator需要添加对于输入矩阵的位置的判定，后续考虑接入NoC的模拟器
     class CoreTileSimulator:
         def __init__(
