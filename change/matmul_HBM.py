@@ -1,9 +1,9 @@
 from utils import size
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from hardware_model.device import Device
 from software_model.operators import Operator
 from software_model.utils import Tensor, DataType
-from math import ceil, log2, floor
+from math import ceil, log2, sqrt
 import torch
 import time
 import statistics
@@ -12,6 +12,9 @@ import pandas as pd
 import os
 from scalesim.scale_sim import scalesim
 import copy
+import subprocess
+import re
+import tempfile
 
 
 class BatchedMatmul(Operator):
@@ -54,12 +57,12 @@ class BatchedMatmul(Operator):
     #     self.latency = matmul_latency * self.bs  # + pcb_module.io_module.latency * 2
     #     return self.latency
 
-    def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
+    def compile_and_simulate(self, pcb_module: Device, compile_mode: str, noc_model: str = "none"):
         # 策略1：将批量矩阵乘法分解为多个独立的矩阵乘法
         matmul = Matmul(self.data_type)
         _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
         matmul_latency1 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
+            matmul.compile_and_simulate(pcb_module, compile_mode, noc_model=noc_model) * self.bs
         )
         
         print(f"#1 Matmul latency per batch: {matmul_latency1/self.bs*1e3:.4f} ms, Total latency for {self.bs} batches: {matmul_latency1*1e3:.4f} ms")
@@ -71,7 +74,7 @@ class BatchedMatmul(Operator):
         )
         # todo:latency2的后半部分的数据读取的延迟需要修改为HBM架构
         matmul_latency2 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode)
+            matmul.compile_and_simulate(pcb_module, compile_mode, noc_model=noc_model)
             + (self.bs - 1)
             * self.M
             * self.N
@@ -370,6 +373,7 @@ class Matmul(Operator):
         self,
         pcb_module: Device,
         compile_mode: str = "3D_stacked",
+        noc_model: str = "none",
     ):
         print(f"\n{'='*70}")
         print(f"Starting compile_and_simulate - Mode: {compile_mode}")
@@ -494,6 +498,7 @@ class Matmul(Operator):
                                     self.computational_graph,
                                     stacked_mapping,
                                     pcb_module,
+                                    noc_model=noc_model,
                                 )
                                 if cycle_count < min_cycle_count:
                                     min_cycle_count = cycle_count
@@ -529,7 +534,17 @@ class Matmul(Operator):
         computational_graph:ComputationalGraph,
         stacked_mapping:Stacked_Mapping,
         pcb_module:Device,
+        noc_model:str = "none",  # NoC模拟模式: "none","estimate", "booksim"
     ) -> int:
+        """
+        根据mapping进行任务分割并模拟执行
+        
+        Args:
+            noc_model: NoC模拟模型选择
+                - "none": 不考虑NoC拥塞，取批次内最大执行时间
+                - "estimate": 使用简单估算模型考虑NoC拥塞
+                - "booksim": 使用BookSim进行精确NoC模拟
+        """
         if self.look_up_table is None:
             self.look_up_table = pd.read_csv(
                 f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
@@ -696,21 +711,428 @@ class Matmul(Operator):
             custom_batches=getattr(stacked_mapping, "custom_batches", None),
         )
 
-        for batch in batches:
-            # 同一批次内并行执行，取最长 tile 时间
+        for batch_idx, batch in enumerate(batches):
+            # 同一HBMtile批次内并行执行，取最长 tile 时间
             if not batch:
                 continue
-            batch_cycles = 0
-            for (m_idx, n_idx, k_idx) in batch: #遍历整个batch（并行同一批次内的HBM tile）
-                # 越界保护（最后一片包含边界剩余块）
-                if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
-                    continue
-                tile = hbm_tiles[m_idx, n_idx, k_idx]
-                batch_cycles = max(batch_cycles, tile.compute_cycle_count)  # 取最长 HBM tile 执行时间
-            total_cycle_count += batch_cycles
+            
+            # NoC模拟：根据选择的模型计算批次执行时间
+            if noc_model == "none":
+                # 原方案：不考虑NoC拥塞，仅取批次内最大执行时间
+                batch_cycles = 0
+                for (m_idx, n_idx, k_idx) in batch:
+                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                        continue
+                    tile = hbm_tiles[m_idx, n_idx, k_idx]
+                    batch_cycles = max(batch_cycles, tile.compute_cycle_count)
+                total_cycle_count += batch_cycles
+            
+            elif noc_model == "estimate":
+                # 简化环形通信估算：适用于对角线调度
+                # 1. 计算批次内最大计算时间(所有HBM tile并行执行)
+                max_compute_cycles = 0
+                for (m_idx, n_idx, k_idx) in batch:
+                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                        continue
+                    tile = hbm_tiles[m_idx, n_idx, k_idx]
+                    max_compute_cycles = max(max_compute_cycles, tile.compute_cycle_count)
+                
+                
+                # 2. 计算NoC通信时间(环形传输,取最大链路)
+                comm_cycles = self.simulate_ring_communication_estimate(
+                    batch, hbm_tiles, pcb_module, batch_id=batch_idx
+                )
+
+                # 3. 批次总时间 = 计算时间 + 通信时间
+                # 通信和计算串行执行
+                batch_cycles = max_compute_cycles + comm_cycles
+
+                
+                total_cycle_count += batch_cycles
+            
+            elif noc_model == "booksim":
+                # *BookSim 精确模拟
+                # 为每个批次生成独立的 trace 和配置文件
+                
+                # 创建临时文件
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    trace_file = os.path.join(tmpdir, f"noc_trace_batch_{batch_idx}.txt")
+                    config_file = os.path.join(tmpdir, f"booksim_config_batch_{batch_idx}.txt")
+                    
+                    # 生成 trace
+                    self.generate_batch_trace_for_booksim(
+                        batch=batch,
+                        hbm_tiles=hbm_tiles,
+                        stacked_mapping=stacked_mapping,
+                        pcb_module=pcb_module,
+                        trace_file=trace_file,
+                    )
+                    
+                    # 生成配置文件
+                    self.generate_booksim_config(
+                        pcb_module=pcb_module,
+                        trace_file=trace_file,
+                        config_file=config_file,
+                        output_dir=tmpdir,
+                    )
+                    
+                    # 运行 BookSim
+                    metrics = self.run_booksim_and_parse(config_file)
+                    
+                    # 检查是否需要回退
+                    if metrics.get('fallback', False):
+                        print(f"Batch {batch_idx}: BookSim unavailable, skipping NoC penalty")
+                        batch_cycles = 0
+                    else:
+                        # 使用 BookSim 结果
+                        batch_cycles = metrics['max_completion_cycle']
+                        print(f"Batch {batch_idx}: BookSim max_latency={batch_cycles} cycles, "
+                              f"avg_latency={metrics['avg_latency']:.1f}, "
+                              f"avg_hops={metrics['avg_hops']:.1f}, "
+                              f"packets={metrics['total_packets']}")
+                    
+                    total_cycle_count += batch_cycles
+            
+            else:
+                raise ValueError(f"Unknown noc_model: {noc_model}. Use 'none', 'estimate', or 'booksim'.")
 
         return total_cycle_count
+    
+    
+    def _get_channel_coords(self, channel_id: int, mesh_dim_x: int) -> tuple:
+        """计算 channel 在 2D mesh 中的坐标"""
+        # *逻辑坐标到物理拓扑，目前为简单的按行排列，如果需要修改物理拓扑，在这里调整
+        return (channel_id // mesh_dim_x, channel_id % mesh_dim_x)
+        
 
+    
+    def _get_channel_manhattan_distance(self, src_channel: int, dst_channel: int, mesh_dim_x: int) -> int:
+        """计算两个 channel 的物理拓扑之间的曼哈顿距离"""
+        y1, x1 = self._get_channel_coords(src_channel, mesh_dim_x)
+        y2, x2 = self._get_channel_coords(dst_channel, mesh_dim_x)
+        return abs(y1 - y2) + abs(x1 - x2)
+    
+    def _get_point_to_point_comm_time(
+        self, 
+        size_bytes: int, 
+        src_channel: int, 
+        dst_channel: int, 
+        mesh_dim_x: int,
+        pcb_module: Device,
+        clock_freq: float
+    ) -> int:
+        """计算点对点通信延迟，参考 draw_tp.py 的模型
+        
+        延迟模型: T = (hops * Lf) + (packets - 1) * Lh
+        """
+        if size_bytes <= 0:
+            return 0
+        
+        # 计算跳数
+        hops = self._get_channel_manhattan_distance(src_channel, dst_channel, mesh_dim_x)
+        
+        # 计算包数
+        num_packets = ceil(size_bytes / (pcb_module.noc_module.bandwidth * pcb_module.noc_module.hop_latency))
+        
+        # 计算延迟
+        if num_packets <= 1:
+            return int(hops * pcb_module.noc_module.first_packet_latency * clock_freq)
+        
+        startup_latency = hops * pcb_module.noc_module.first_packet_latency * clock_freq
+        serialization_latency = (num_packets - 1) * pcb_module.noc_module.hop_latency * clock_freq
+        print(f"Comm from channel {src_channel} to {dst_channel}: size={size_bytes} B, hops={hops}, packets={num_packets}, startup={startup_latency} cycles, serialization={serialization_latency} cycles")
+        return int(startup_latency + serialization_latency)
+    
+    def simulate_ring_communication_estimate(
+        self,
+        batch: List[Tuple[int, int, int]],
+        hbm_tiles: np.ndarray,
+        pcb_module: Device,
+        batch_id: int = 0,
+    ) -> int:
+        """
+        基于 2D mesh 的通信估算，适用于对角线调度策略
+        
+        对角线调度逻辑:
+        - 第1批(batch_id=0): core0 用 (channel0_A × channel0_B), core1 用 (channel1_A × channel1_B), ...
+        - 第2批(batch_id=1): core0 用 (channel0_A × channel1_B), core1 用 (channel1_A × channel2_B), ...
+        - 第k批(batch_id=k): core_i 用 (channel_i_A × channel_(i+k)%N_B)
+        
+        通信模式:
+        - A矩阵：每个core从自己对应的channel读取(本地,无NoC)
+        - B矩阵：需要从其他channel读取,涉及跨channel NoC传输
+        - 2D mesh 结构：考虑曼哈顿距离和虫孔路由延迟
+        
+        延迟模型: T = (hops * Lf) + (packets - 1) * Lh
+        
+        Args:
+            batch: 当前批次的 tile 列表 [(m_idx, n_idx, k_idx), ...]
+            hbm_tiles: HBM tile 对象数组
+            pcb_module: 硬件设备配置
+            batch_id: 批次编号(用于确定通信模式)
+        
+        Returns:
+            通信延迟(以 cycle 为单位)
+        """
+        
+        channel_count = pcb_module.memory_module.channel_count
+        
+        # 如果是第一批(对角线),所有core都用本地数据,无需NoC通信
+        if batch_id == 0:
+            return 0
+        
+        # 计算 mesh 维度（采取近似方阵）
+        mesh_dim_x = int(ceil(sqrt(channel_count)))
+        # mesh_dim_y = int(ceil(channel_count / mesh_dim_x))
+        
+        clock_freq = pcb_module.compute_module.clock_freq
+        
+        # 统计批次中所有的点对点通信
+        comm_times = []
+        for (m_idx, n_idx, k_idx) in batch:
+            tile = hbm_tiles[m_idx, n_idx, k_idx]
+            
+            # 对角线调度: B矩阵从 n_idx channel 传到 m_idx channel
+            src_channel = n_idx % channel_count
+            dst_channel = m_idx % channel_count
+            
+            # 如果是本地数据，跳过
+            if src_channel == dst_channel:
+                continue
+            
+            # B 矩阵大小
+            # *计算的是整个权重矩阵的大小，即得到*传输*整个权重矩阵的总延迟，配合上原有的HBMtile中的读取延迟（1338行），可能非常完美的包含了所有的延迟，甚至还有减少重复读取的判定
+            data_size = tile.K * tile.N * self.data_type.word_size
+            
+            # 计算这次通信的延迟
+            time_cycles = self._get_point_to_point_comm_time(
+                data_size, src_channel, dst_channel, mesh_dim_x,
+                pcb_module, clock_freq
+            )
+            comm_times.append(time_cycles)
+        
+        # 返回所有通信中的最大延迟（瓶颈）
+        return max(comm_times) if comm_times else 0
+    
+    
+    @staticmethod
+    def _bytes_to_flits(data_bytes: int, flit_size_bits: int = 128) -> int:
+        """将字节数转换为 flit 数量"""
+        return ceil(data_bytes * 8 / flit_size_bits)
+    
+    
+    def generate_batch_trace_for_booksim(
+        self,
+        batch: List[Tuple[int, int, int]],
+        hbm_tiles: np.ndarray,
+        stacked_mapping: 'Matmul.Stacked_Mapping',
+        pcb_module: Device,
+        trace_file: str,
+        batch_start_cycle: int = 0,
+        include_intra_channel: bool = False,
+    ) -> None:
+        """
+        为一个批次生成 BookSim trace 文件（ring 拓扑，只有 core 节点）。
+
+        Trace 格式（每行）：
+        cycle src_node dest_node packet_size_flits
+
+        节点映射：node_id = channel_id * cores_per_channel + local_core_id
+        - 仅 core 节点在 NoC 上；HBM 不直接连到 NoC
+        - 数据从所在 channel 的一个代表 core（local_core_id=0）注入网络
+        - 仅跨 channel 传输写入 trace；同 channel 默认忽略
+        """
+
+        channel_count = pcb_module.memory_module.channel_count
+        core_count = pcb_module.compute_module.core_count
+        cores_per_channel = core_count // channel_count
+
+        with open(trace_file, 'w') as f:
+            f.write("# BookSim Trace (ring, cores only)\n")
+            f.write("# Format: cycle src_node dest_node packet_size_flits\n")
+            f.write(f"# Channels: {channel_count}, Cores per channel: {cores_per_channel}\n")
+            f.write("# node_id = channel_id * cores_per_channel + local_core_id\n")
+            f.write("# HBM injects via local_core_id=0 of the data channel\n")
+            f.write("#\n")
+
+            current_cycle = batch_start_cycle
+
+            for (m_idx, n_idx, k_idx) in batch:
+                if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                    continue
+
+                tile = hbm_tiles[m_idx, n_idx, k_idx]
+
+                # 1) 计算 core 归属：按 A 的 channel（m_idx）
+                compute_channel = m_idx % channel_count
+                local_core_id = n_idx % cores_per_channel
+                dest_node = compute_channel * cores_per_channel + local_core_id
+
+                # 2) 权重 B 所在 channel（按 n_idx），跨 channel 则生成通信
+                weight_channel = n_idx % channel_count
+                weight_data_size = tile.K * tile.N * tile.data_type.word_size
+
+                if weight_channel != compute_channel:
+                    src_node = weight_channel * cores_per_channel  # gateway core of weight channel
+                    packet_size = self._bytes_to_flits(weight_data_size)
+                    f.write(f"{current_cycle} {src_node} {dest_node} {packet_size}\n")
+                elif include_intra_channel and cores_per_channel > 1 and local_core_id != 0:
+                    # 可选：同 channel 多核场景，仍用 core0 作为注入源
+                    src_node = weight_channel * cores_per_channel
+                    packet_size = self._bytes_to_flits(weight_data_size)
+                    f.write(f"{current_cycle} {src_node} {dest_node} {packet_size}\n")
+
+                # 输入 A 与计算 core 在同一 channel，按当前策略不写 trace
+
+                # 3) 时间戳策略：默认保持 batch_start_cycle，不在批内累加
+                # 如需按批次串行，可在调用处传入累加后的 batch_start_cycle
+    
+    """从此处往下有关booksim的函数（到HBMtileSimulator为止）全部为未经验证的新增代码，为确保结构完整性暂时保留，可以视为没用"""
+    def generate_booksim_config(
+        self,
+        pcb_module: Device,
+        trace_file: str,
+        config_file: str,
+        output_dir: str = ".",
+    ) -> None:
+        """
+        生成 BookSim 配置文件
+        
+        默认采用 ring 拓扑，节点为所有 core（HBM 不接入 NoC）。
+        """
+        
+        channel_count = pcb_module.memory_module.channel_count
+        core_count = pcb_module.compute_module.core_count
+        cores_per_channel = core_count // channel_count
+        
+        # 总节点数 = 所有 core 数
+        total_nodes = core_count
+        
+        # ring 拓扑参数
+        k = total_nodes  # ring 节点数
+        
+        with open(config_file, 'w') as f:
+            f.write("// BookSim Configuration for 3D Stacked HBM Architecture\n")
+            f.write(f"// Generated for {channel_count} channels, {cores_per_channel} cores per channel\n")
+            f.write(f"// Total nodes (cores only): {total_nodes}\n\n")
+            
+            # 拓扑
+            f.write("// Topology\n")
+            f.write("topology = ring;\n")
+            f.write(f"k = {k};\n")
+            f.write("n = 1;\n")  # ring
+            f.write("\n")
+            
+            # 路由
+            f.write("// Routing\n")
+            f.write("routing_function = dor;\n")  # 对 ring 为顺时针/反向 DOR
+            f.write("num_vcs = 4;\n")  # Virtual channels
+            f.write("vc_buf_size = 8;\n")  # VC buffer size (flits)
+            f.write("\n")
+            
+            # 流控
+            f.write("// Flow control\n")
+            f.write("wait_for_tail_credit = 1;\n")
+            f.write("\n")
+            
+            # 链路参数
+            f.write("// Link parameters\n")
+            # 假设链路带宽 = 128 bits = 16 bytes per cycle（与 flit_size 对齐）
+            flit_size_bytes = 128 // 8  # 16 bytes per flit
+            f.write("\n")
+            
+            # Trace 模式
+            f.write("// Traffic\n")
+            f.write("traffic = trace;\n")
+            f.write(f"trace_file = {trace_file};\n")
+            f.write("sim_type = trace;\n")
+            f.write("\n")
+            
+            # 统计参数
+            f.write("// Statistics\n")
+            f.write("watch_out = -;\n")  # 禁用详细输出
+            f.write(f"stats_out = {output_dir}/booksim_stats.txt;\n")
+            f.write("\n")
+    
+    
+    def run_booksim_and_parse(
+        self,
+        config_file: str,
+        booksim_path: str = "/home/pc/booksim2/booksim",
+    ) -> dict:
+        """
+        运行 BookSim 并解析结果
+        
+        返回：
+        {
+            'max_completion_cycle': int,  # 最大完成时间
+            'avg_latency': float,          # 平均延迟
+            'avg_hops': float,             # 平均跳数
+            'total_packets': int,          # 总数据包数
+        }
+        """
+        
+        # 检查 BookSim 是否存在
+        if not os.path.exists(booksim_path):
+            print(f"Warning: BookSim not found at {booksim_path}")
+            print("Falling back to noc_model='none' (no NoC penalty)")
+            return {'max_completion_cycle': 0, 'fallback': True}
+        
+        try:
+            # 运行 BookSim
+            result = subprocess.run(
+                [booksim_path, config_file],
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5分钟超时
+            )
+            
+            output = result.stdout
+            
+            # 解析关键指标
+            metrics = {
+                'max_completion_cycle': 0,
+                'avg_latency': 0,
+                'avg_hops': 0,
+                'total_packets': 0,
+                'fallback': False,
+            }
+            
+            for line in output.split('\n'):
+                # Packet latency average = 45.3
+                if 'Packet latency average' in line or 'packet latency average' in line:
+                    match = re.search(r'= ([\d.]+)', line)
+                    if match:
+                        metrics['avg_latency'] = float(match.group(1))
+                
+                # Maximum packet latency = 120
+                if 'Maximum packet latency' in line or 'maximum packet latency' in line:
+                    match = re.search(r'= ([\d.]+)', line)
+                    if match:
+                        metrics['max_completion_cycle'] = int(float(match.group(1)))
+                
+                # Average hops = 3.2
+                if 'Average hops' in line or 'average hops' in line:
+                    match = re.search(r'= ([\d.]+)', line)
+                    if match:
+                        metrics['avg_hops'] = float(match.group(1))
+                
+                # Total packets = 1024
+                if 'Total packets' in line or 'Sent packets' in line or 'total packets' in line:
+                    match = re.search(r'= ([\d]+)', line)
+                    if match:
+                        metrics['total_packets'] = int(match.group(1))
+            
+            return metrics
+            
+        except subprocess.TimeoutExpired:
+            print("Warning: BookSim simulation timeout!")
+            return {'max_completion_cycle': 0, 'fallback': True}
+        except Exception as e:
+            print(f"Warning: BookSim execution failed: {e}")
+            return {'max_completion_cycle': 0, 'fallback': True}
+    
+    
     
     class HBMTileSimulator:
         def __init__(
@@ -735,6 +1157,22 @@ class Matmul(Operator):
             self.compute_cycle_count = self.simulate_hbm_tile_compute_cycle_count(
                 M, N, K, data_type, Stacked_Mapping, pcb_module, look_up_table
             )
+
+        
+        def dram_load_cycle(self, size: int, word_size: int):
+            size_bytes = size * word_size
+            model = getattr(self.pcb_module.memory_module, "dram_model", None)
+            if model is None:
+                # 回退：按带宽估算（与原先逻辑保持一致）
+                return ceil(size_bytes / self.pcb_module.compute_module.channel_bandwidth_per_cycle)
+            return model.load_cycles(size_bytes, word_size)
+
+        def dram_store_cycle(self, size: int, word_size: int):
+            size_bytes = size * word_size
+            model = getattr(self.pcb_module.memory_module, "dram_model", None)
+            if model is None:
+                return ceil(size_bytes / self.pcb_module.compute_module.channel_bandwidth_per_cycle)
+            return model.store_cycles(size_bytes, word_size)
 
         def simulate_hbm_tile_compute_cycle_count(
             self,
@@ -878,7 +1316,7 @@ class Matmul(Operator):
                 M_N_tile_size[:M_core_t, -1] = core_tile_M * N_remain
             if M_remain > 0 and N_remain > 0:
                 M_N_tile_size[-1, -1] = M_remain * N_remain
-            # todo:从这里往下进行了大幅度的修改，需要重点检查
+            
 
             # 支持可配置的 m channel - n core 架构
             # 从 device 读取配置：假设 channel_count 和 core_count 定义在 compute_module 中
@@ -891,15 +1329,13 @@ class Matmul(Operator):
             
             total_cycle_count = 0
             
-            # 根据每个 channel 的 core 数量决定并行度
+            # 根据每个 channel 的 core 数量决定并行度，开始运算此HBMtile的计算时间+读取时间
+            print("cores_per_channel: ", cores_per_channel)
             if cores_per_channel == 1:
                 # *单核模式：完全串行，保留数据重用
                 # 读取第一个 core tile 的数据
-                total_cycle_count += ceil(
-                    (M_K_tile_size[0, 0] + K_N_tile_size[0, 0])
-                    * data_type.word_size
-                    / pcb_module.compute_module.channel_bandwidth_per_cycle
-                )
+                total_cycle_count += self.dram_load_cycle(M_K_tile_size[0, 0] + K_N_tile_size[0, 0], data_type.word_size)
+
                 
                 previous_m = 0
                 previous_n = 0
@@ -920,23 +1356,13 @@ class Matmul(Operator):
                     
                     current_tile_read_cycle_count = 0
                     if m != previous_m or k != previous_k:
-                        current_tile_read_cycle_count += ceil(
-                            M_K_tile_size[m, k]
-                            * data_type.word_size
-                            / pcb_module.compute_module.channel_bandwidth_per_cycle
-                        )
+                        current_tile_read_cycle_count += self.dram_load_cycle(M_K_tile_size[m, k], data_type.word_size)
+
                     if k != previous_k or n != previous_n:
-                        current_tile_read_cycle_count += ceil(
-                            K_N_tile_size[k, n]
-                            * data_type.word_size
-                            / pcb_module.compute_module.channel_bandwidth_per_cycle
-                        )
+                        current_tile_read_cycle_count += self.dram_load_cycle(K_N_tile_size[k, n], data_type.word_size)
+
                     if k > 0 and (m != previous_m or n != previous_n):
-                        current_tile_read_cycle_count += ceil(
-                            M_N_tile_size[m, n]
-                            * data_type.word_size
-                            / pcb_module.compute_module.channel_bandwidth_per_cycle
-                        )
+                        current_tile_read_cycle_count += self.dram_load_cycle(M_N_tile_size[m, n], data_type.word_size)
                     
                     previous_tile_compute_cycle_count = previous_core_tile.compute_cycle_count
                     if previous_k > 0:
@@ -949,11 +1375,7 @@ class Matmul(Operator):
                     if m == previous_m and n == previous_n:
                         previous_tile_write_cycle_count = 0
                     else:
-                        previous_tile_write_cycle_count = ceil(
-                            M_N_tile_size[previous_m, previous_n]
-                            * data_type.word_size
-                            / pcb_module.compute_module.channel_bandwidth_per_cycle #更换计算目标矩阵时写回数据到HBM中
-                        )
+                        previous_tile_write_cycle_count = self.dram_store_cycle(M_N_tile_size[previous_m, previous_n], data_type.word_size)
                     
                     total_cycle_count += (
                         max(
@@ -975,11 +1397,7 @@ class Matmul(Operator):
                         * last_core_tile.N
                         / pcb_module.compute_module.core.vector_unit.total_vector_flops_per_cycle
                     )
-                last_tile_write_cycle_count = ceil(
-                    M_N_tile_size[previous_m, previous_n]
-                    * data_type.word_size
-                    / pcb_module.compute_module.channel_bandwidth_per_cycle
-                )
+                last_tile_write_cycle_count = self.dram_store_cycle(M_N_tile_size[previous_m, previous_n], data_type.word_size)
                 total_cycle_count += last_tile_compute_cycle_count + last_tile_write_cycle_count
             
             else:
@@ -1077,23 +1495,15 @@ class Matmul(Operator):
                         + current_batch_K_N_read_count
                         + current_batch_M_N_read_count
                     )
-                    current_batch_read_cycle_count = ceil(
-                        current_batch_read_count
-                        * pcb_module.compute_module.core.systolic_array.input_word_size
-                        / pcb_module.compute_module.channel_bandwidth_per_cycle
-                    )
-                    prvious_batch_write_cycle_count = ceil(
-                        previous_batch_M_N_write_count
-                        * pcb_module.compute_module.core.systolic_array.output_word_size
-                        / pcb_module.compute_module.channel_bandwidth_per_cycle
-                    )
+                    current_batch_read_cycle_count = self.dram_load_cycle(current_batch_read_count, pcb_module.compute_module.core.systolic_array.input_word_size)
+                    previous_batch_write_cycle_count = self.dram_store_cycle(previous_batch_M_N_write_count, pcb_module.compute_module.core.systolic_array.output_word_size)
                     
                     total_cycle_count += (
                         max(
                             current_batch_read_cycle_count,
                             previous_batch_compute_cycle_count,
                         )
-                        + prvious_batch_write_cycle_count
+                        + previous_batch_write_cycle_count
                     )
                     
                     previous_batch_compute_cycle_count = current_batch_compute_cycle_count
@@ -1113,7 +1523,6 @@ class Matmul(Operator):
 
             return total_cycle_count
 
-    # *Core Tile Simulator需要添加对于输入矩阵的位置的判定，后续考虑接入NoC的模拟器
     class CoreTileSimulator:
         def __init__(
             self,

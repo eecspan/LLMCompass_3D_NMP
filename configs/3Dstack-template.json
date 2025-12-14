@@ -20,7 +20,7 @@
         "compute_chiplet_count": 1,
         "compute_chiplet": {
             "physical_core_count": 9,  
-            "core_count": 8,
+            "core_count": 16,
             "_commet_core":"需要注意暂时选择channel数和core数保持一致，1core-1channel",
             
             "process_node": "7nm",
@@ -67,17 +67,36 @@
             "_commet_global_buffer":"令L2缓存不存在来起到直接对接HBM和core的效果",
 
             "memory_channel_physical_count": 9,
-            "memory_channel_active_count": 8,
+            "memory_channel_active_count": 16,
 
             "bandwidth_per_channel_byte":40e9, 
             "_commet_bandwidth_of_HBM <-> core":"假设每个channel带宽为40GB/s",
+
+            "noc_bandwidth_byte_per_second": 40e9,
+            "noc_first_packet_latency_second": 25e-9,
+            "noc_hop_latency_second": 1e-9,
+            "_commet_noc": "NoC参数: 带宽40GB/s, 首包延迟25ns, 每跳延迟1ns (2D mesh结构), 用于core间数据传输",
 
             "pin_count_per_channel": 1024,
             "bandwidth_per_pin_bit": 3.2e9,
             "_commet_of_pin":"暂时不清楚pin部分是否需要做修改，先行保留"
         },
         "memory": {
-            "total_capacity_GB": 80
+            "total_capacity_GB": 80,
+            "dram": {
+                "model": "bandwidth",
+                "bandwidth_per_cycle": 40e9,
+                "ramulator_path": "/home/panyudong/work/3d-monitor/attacc_simulator/ramulator2/ramulator2",
+                "clean_temp": false,
+                "n_channel": 16,
+                "n_pch": 2,
+                "n_rank": 2,
+                "n_bank": 4,
+                "n_bg": 4,
+                "n_row": 16384,
+                "n_col": 32,
+                "prefetch_size": 32
+            }
         }
     }
 }

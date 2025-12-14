@@ -1,0 +1,35 @@
+Frontend:
+  impl: LoadStoreTrace
+  path: store_bank_level.trace
+  clock_ratio: 1
+
+  Translation:
+    impl: NoTranslation
+    max_addr: 2147483648
+              
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+  DRAM:
+    impl: HBM3
+    org:
+      preset: HBM3_8Gb_2R
+      channel: 16
+    timing:
+      preset: HBM3_5.2Gbps
+
+  Controller:
+    impl: HBM3
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBankHBM3
+      #impl: No
+    plugins:
+      - ControllerPlugin:
+          impl: HBM3TraceRecorder
+          path: /home/panyudong/work/3d-monitor/attacc_simulator/ramulator2/log/load/load_cmd.log
+
+  AddrMapper:
+    impl: HBM3-Custom

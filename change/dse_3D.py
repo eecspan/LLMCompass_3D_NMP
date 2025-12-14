@@ -7,7 +7,8 @@ from hardware_model.compute_module import (
     overhead_dict,
 )
 from hardware_model.io_module import IOModule
-from hardware_model.memory_module import MemoryModule
+from hardware_model.memory_module import MemoryModule, RamulatorDRAMModel, BandwidthDRAMModel
+from hardware_model.noc_module import NOCModule
 from hardware_model.device import Device
 from hardware_model.interconnect import LinkModule, InterConnectModule, TopologyType
 from hardware_model.system import System
@@ -76,13 +77,42 @@ def template_to_system(arch_specs):
         // 8,
         1e-6,
     )
+
+    # noc module
+    noc_module = NOCModule(
+        io_specs["noc_bandwidth_byte_per_second"],
+        io_specs["noc_first_packet_latency_second"],
+        io_specs["noc_hop_latency_second"],
+    )
+
     # memory module
     memory_module = MemoryModule(
         device_specs["memory"]["total_capacity_GB"] * 1024 * 1024 * 1024,
         io_specs["memory_channel_active_count"],
     )
+    # attach DRAM model (bandwidth | ramulator) from config
+    dram_cfg = device_specs["memory"].get("dram", {})
+    model_type = dram_cfg.get("model", "bandwidth")
+    if model_type == "ramulator":
+        print("使用bandwidth\n")
+        dram_model = RamulatorDRAMModel(
+            channel_count=io_specs["memory_channel_active_count"],
+            ramulator_path=dram_cfg["ramulator_path"],
+            clean_temp=dram_cfg.get("clean_temp", False),
+            cfg=dram_cfg,  # 平铺的 n_channel/n_row/... 直接传入
+        )
+    else:
+        print("使用bandwidth\n")
+        dram_model = BandwidthDRAMModel(
+            dram_cfg.get(
+                "bandwidth_per_cycle",
+                # 默认用已有等效带宽
+                compute_module.channel_bandwidth_per_cycle,
+            )
+        )
+    memory_module.set_dram_model(dram_model)
     # device
-    device = Device(compute_module, io_module, memory_module)
+    device = Device(compute_module, io_module, memory_module, noc_module)
     # interconnect
     interconnect_specs = arch_specs["interconnect"]
     link_specs = interconnect_specs["link"]
