@@ -6,7 +6,7 @@ import argparse
 from collections import defaultdict
 
 # Constants for HBM geometry and granularity
-n_channel = 16
+channel_per_nmp = 16
 n_pch = 2
 n_rank = 2
 n_bank = 4
@@ -38,9 +38,9 @@ def apply_config(geom: dict | None = None):
     根据 config 更新几何参数，并重算 HBM_GS。
     仅更新提供的键，未提供的保持默认。
     """
-    global n_channel, n_pch, n_rank, n_bank, n_bg, n_row, n_col, prefetch_size, data_size, HBM_GS
+    global channel_per_nmp, n_pch, n_rank, n_bank, n_bg, n_row, n_col, prefetch_size, data_size, HBM_GS
     if geom:
-        for k in ["n_channel","n_pch","n_rank","n_bank","n_bg","n_row","n_col","prefetch_size","data_size"]:
+        for k in ["channel_per_nmp","n_pch","n_rank","n_bank","n_bg","n_row","n_col","prefetch_size","data_size"]:
             if k in geom:
                 globals()[k] = geom[k]
 
@@ -121,7 +121,7 @@ def generate_trace_per_channel(address_list):
 
 def FC_bank_level(N, K, data_size, addr_offset, itr, valid_channel=None):
     if valid_channel is None:
-        valid_channel = n_channel
+        valid_channel = channel_per_nmp
     print("valid channel: ", valid_channel)
     # batch_list = []
     col_set = set()
@@ -259,7 +259,7 @@ def load_store_cycle_func(
     run_fc(inst_str, fcN, fcK, data_size, output)
 
     # === Step 2: Generate YAML config ===
-    channel = n_channel  # fixed
+    channel = channel_per_nmp  # fixed
     yaml_name = f"{name}_ch{channel}_{mapping}.yaml"
     make_yaml_file(yaml_name, output, channel, mapping)
 

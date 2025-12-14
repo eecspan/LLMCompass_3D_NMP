@@ -84,11 +84,11 @@
         "memory": {
             "total_capacity_GB": 80,
             "dram": {
-                "model": "bandwidth",
+                "model": "ramulator",
                 "bandwidth_per_cycle": 40e9,
                 "ramulator_path": "/home/panyudong/work/3d-monitor/attacc_simulator/ramulator2/ramulator2",
                 "clean_temp": false,
-                "n_channel": 16,
+                "channel_per_nmp": 1,
                 "n_pch": 2,
                 "n_rank": 2,
                 "n_bank": 4,

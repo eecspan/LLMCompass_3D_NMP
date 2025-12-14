@@ -94,7 +94,6 @@ def template_to_system(arch_specs):
     dram_cfg = device_specs["memory"].get("dram", {})
     model_type = dram_cfg.get("model", "bandwidth")
     if model_type == "ramulator":
-        print("使用bandwidth\n")
         dram_model = RamulatorDRAMModel(
             channel_count=io_specs["memory_channel_active_count"],
             ramulator_path=dram_cfg["ramulator_path"],
@@ -102,7 +101,6 @@ def template_to_system(arch_specs):
             cfg=dram_cfg,  # 平铺的 n_channel/n_row/... 直接传入
         )
     else:
-        print("使用bandwidth\n")
         dram_model = BandwidthDRAMModel(
             dram_cfg.get(
                 "bandwidth_per_cycle",

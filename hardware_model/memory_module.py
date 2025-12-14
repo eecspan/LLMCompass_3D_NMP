@@ -26,9 +26,6 @@ class RamulatorDRAMModel(DRAMModel):
         from hardware_model import ramulator_interface as rami
         self.rami = rami
         cfg = dict(cfg or {})
-        if "n_channel" in cfg and cfg["n_channel"] != channel_count:
-            raise ValueError(f"n_channel mismatch: device={channel_count}, config={cfg['n_channel']}")
-        cfg["n_channel"] = channel_count
         self.rami.apply_config(cfg)  # 平铺键值：n_pch/n_rank/.../data_size 等
         self.ramulator_path = ramulator_path
         self.clean_temp = clean_temp
@@ -54,11 +51,9 @@ class RamulatorDRAMModel(DRAMModel):
         return cycles
 
     def load_cycles(self, size_bytes: int, word_size: int = 2) -> int:
-        print("使用ramulator模拟LD\n")
         return self._get_cycles("LD", size_bytes, word_size)
 
     def store_cycles(self, size_bytes: int, word_size: int = 2) -> int:
-        print("使用ramulator模拟ST\n")
         return self._get_cycles("ST", size_bytes, word_size)
 
 
