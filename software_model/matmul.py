@@ -12,7 +12,7 @@ import pandas as pd
 import os
 from scalesim.scale_sim import scalesim
 import copy
-
+import os
 
 class BatchedMatmul(Operator):
     def __init__(self, data_type: DataType):
@@ -1415,8 +1415,10 @@ class Matmul(Operator):
                     (N, M, K, array_height, array_width, dataflow), "cycle_count"
                 ].item()
             except KeyError:
+                temp_dir = "./systolic_array_model/temp"
+                os.makedirs(temp_dir, exist_ok=True)
                 # print('not found in look up table')
-                config = f"./systolic_array_model/temp/systolic_array_{os.getpid()}.cfg"
+                config = f"{temp_dir}/systolic_array_{os.getpid()}.cfg"
                 with open(config, "w") as f:
                     f.writelines("[general]\n")
                     f.writelines("run_name = systolic_array\n\n")
@@ -1435,7 +1437,7 @@ class Matmul(Operator):
                     f.writelines("[run_presets]\n")
                     f.writelines("InterfaceBandwidth: CALC\n")
 
-                topology = f"./systolic_array_model/temp/matmul_{os.getpid()}.csv"
+                topology = f"{temp_dir}/matmul_{os.getpid()}.csv"
                 with open(topology, "w") as f:
                     f.writelines("Layer, M, N, K\n")
                     f.writelines(f"matmul1, {M}, {N}, {K},\n")

@@ -18,9 +18,10 @@ from hardware_model.system import System
 
 
 class TransformerBlockInitComputationTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType):
+    def __init__(self, d_model, d_intermediate, n_heads, device_count, data_type: DataType):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
+        self.d_intermediate = d_intermediate
         self.n_heads = n_heads
         self.device_count = device_count
         # parameters per device
@@ -29,8 +30,8 @@ class TransformerBlockInitComputationTP(Operator):
         self.Wk = Tensor([d, d // device_count], data_type)
         self.Wv = Tensor([d, d // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
-        self.W1 = Tensor([d, 4 * d // device_count], data_type)
-        self.W2 = Tensor([4 * d // device_count, d], data_type)
+        self.W1 = Tensor([d, d_intermediate // device_count], data_type)
+        self.W2 = Tensor([d_intermediate // device_count, d], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -64,12 +65,13 @@ class TransformerBlockInitComputationTP(Operator):
         # d_h: dimension per head
         b, s, d = X.shape
         assert d == self.d_model
+        d_intermediate = self.d_intermediate
         h = self.n_heads
         dev_cnt = self.device_count
         d_h = d // h
 
         # multi-head attention
-        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt] 这一步导入了wq权重矩阵，借用matmul的call函数利用wq和输入矩阵X生成computational_graph，为后续的compile-and-simulate提供矩阵大小信息支持
+        Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt]
         assert Q.shape == [b, s, d // dev_cnt]
         K = self.K_proj(X, self.Wk)  # [b, s, d / dev_cnt]
         V = self.V_proj(X, self.Wv)  # [b, s, d / dev_cnt]
@@ -99,8 +101,8 @@ class TransformerBlockInitComputationTP(Operator):
             H0 = self.allreduce_mha(H0)
 
         # feed-forward network
-        H1 = self.H_matmul1(H0, self.W1)  # [b, s, 4 * d / dev_cnt]
-        assert H1.shape == [b, s, 4 * d // dev_cnt]
+        H1 = self.H_matmul1(H0, self.W1)  # [b, s, d_intermediate / dev_cnt]
+        assert H1.shape == [b, s, d_intermediate // dev_cnt]
         H1 = self.H_gelu(H1)
         H2 = self.H_matmul2(H1, self.W2)  #  [b, s, d]
         assert H2.shape == [b, s, d]
@@ -196,33 +198,33 @@ class TransformerBlockInitComputationTP(Operator):
         interconnect = system.interconnect
 
         # matmul
-        print("simulating qkv") 
-        qkv_latency = 3 * ( #通过输入计算得到QKV
+        print("simulating qkv")
+        qkv_latency = 3 * (
             self.Q_proj.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating q_mul_k")
-        q_mul_k_latency = ( #计算注意力权重A
+        q_mul_k_latency = (
             self.Q_mul_K.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating a_mul_v")
-        a_mul_v_latency = ( #计算注意力权重A与V的乘积H
+        a_mul_v_latency = (
             self.A_mul_V.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h_matmul0")
-        h_matmul0_latency = ( #前馈网络的线性层
+        h_matmul0_latency = (
             self.H_matmul0.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h1_matmul1")
-        h1_matmul1_latency = ( #前馈网络的线性层
+        h1_matmul1_latency = (
             self.H_matmul1.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
         print("simulating h2_matmul2")
-        h2_matmul2_latency = ( #前馈网络的线性层
+        h2_matmul2_latency = (
             self.H_matmul2.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
@@ -353,9 +355,10 @@ class TransformerBlockInitComputationTP(Operator):
 
 
 class TransformerBlockAutoRegressionTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType):
+    def __init__(self, d_model, d_intermediate, n_heads, device_count, data_type: DataType):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
+        self.d_intermediate = d_intermediate
         self.n_heads = n_heads
         self.device_count = device_count
         # parameters per device
@@ -364,8 +367,8 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.Wk = Tensor([d, d // device_count], data_type)
         self.Wv = Tensor([d, d // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
-        self.W1 = Tensor([d, 4 * d // device_count], data_type)
-        self.W2 = Tensor([4 * d // device_count, d], data_type)
+        self.W1 = Tensor([d, d_intermediate // device_count], data_type)
+        self.W2 = Tensor([d_intermediate // device_count, d], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -401,6 +404,7 @@ class TransformerBlockAutoRegressionTP(Operator):
         # d_h: dimension per head
         b, _, d = x.shape
         assert d == self.d_model
+        d_intermediate = self.d_intermediate
         s = seq_len
         h = self.n_heads
         dev_cnt = self.device_count
@@ -445,8 +449,8 @@ class TransformerBlockAutoRegressionTP(Operator):
             h0 = self.allreduce_mha(h0)
 
         # feed-forward network
-        h1 = self.H_matmul1(h0, self.W1)  # [b, 1, 4 * d / dev_cnt]
-        assert h1.shape == [b, 1, 4 * d // dev_cnt]
+        h1 = self.H_matmul1(h0, self.W1)  # [b, 1, d_intermediate / dev_cnt]
+        assert h1.shape == [b, 1, d_intermediate // dev_cnt]
         h1 = self.H_gelu(h1)
         h2 = self.H_matmul2(h1, self.W2)  #  [b, 1, d]
         assert h2.shape == [b, 1, d]

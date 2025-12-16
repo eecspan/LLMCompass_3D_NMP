@@ -123,7 +123,7 @@ class ComputeModule:
         clock_freq,
         l2_size,
         l2_bandwidth_per_cycle,
-        channel_bandwidth_per_cycle,
+        channel_bandwidth_per_cycle = None,
         overhead: Overhead = overhead_dict["A100"],
     ):
         self.core = core
