@@ -611,7 +611,7 @@ class Matmul(Operator):
         N_remain = N % HBM_tile_N
         K_remain = K % HBM_tile_K
 
-        hbm_tiles = np.empty( # 创建一个三维数组，将每一个子矩阵乘作为一个对象，类型是HBMTileSimulator
+        hbm_tiles = np.empty( # 创建一个三维列表，将每一个子矩阵乘作为一个对象，类型是HBMTileSimulator
             [ceil(M / HBM_tile_M), ceil(N / HBM_tile_N), ceil(K / HBM_tile_K)],
             dtype=self.HBMTileSimulator,
         )
@@ -800,9 +800,59 @@ class Matmul(Operator):
     
     
     def _get_channel_coords(self, channel_id: int, mesh_dim_x: int) -> tuple:
-        """计算 channel 在 2D mesh 中的坐标"""
-        # *逻辑坐标到物理拓扑，目前为简单的按行排列，如果需要修改物理拓扑，在这里调整
-        return (channel_id // mesh_dim_x, channel_id % mesh_dim_x)
+        """计算 channel 在 2D mesh 中的坐标（首尾相连蛇形映射）
+        
+        设计逻辑：
+        1. 第一列(col=0)特殊处理：
+        - (0,0) = 0
+        - (1,0) = n-1 (总节点数-1)
+        - (2,0) = n-2
+        - 依次递减
+        
+        2. 剩余部分(col>=1)使用普通蛇形拓扑：
+        - 从1开始编号
+        - 偶数行从左到右
+        - 奇数行从右到左
+        
+        4x4示例：
+        Row 0: 0  1  2  3
+        Row 1: 15 6  5  4
+        Row 2: 14 7  8  9
+        Row 3: 13 12 11 10
+        """
+        if mesh_dim_x % 2 != 0:
+            raise ValueError(f"mesh_dim_x 必须为偶数，当前为 {mesh_dim_x}")
+        
+        total_nodes = mesh_dim_x * mesh_dim_x
+        
+        # 构建坐标到channel_id的映射
+        coord_to_id = {}
+        
+        # 1. 填充第一列(col=0)
+        coord_to_id[(0, 0)] = 0
+        for row in range(1, mesh_dim_x):
+            coord_to_id[(row, 0)] = total_nodes - row
+        
+        # 2. 填充剩余部分(col>=1)，使用普通蛇形拓扑
+        # 从1开始编号
+        current_id = 1
+        for row in range(mesh_dim_x):
+            if row % 2 == 0:
+                # 偶数行：从左到右
+                for col in range(1, mesh_dim_x):
+                    coord_to_id[(row, col)] = current_id
+                    current_id += 1
+            else:
+                # 奇数行：从右到左
+                for col in range(mesh_dim_x - 1, 0, -1):
+                    coord_to_id[(row, col)] = current_id
+                    current_id += 1
+        
+        # 查找对应的坐标
+        for coord, cid in coord_to_id.items():
+            if cid == channel_id:
+                return coord
+        raise ValueError(f"Invalid channel_id {channel_id} for {mesh_dim_x}x{mesh_dim_x} mesh")
         
 
     
@@ -840,7 +890,6 @@ class Matmul(Operator):
         
         startup_latency = hops * pcb_module.noc_module.first_packet_latency * clock_freq
         serialization_latency = (num_packets - 1) * pcb_module.noc_module.hop_latency * clock_freq
-        print(f"Comm from channel {src_channel} to {dst_channel}: size={size_bytes} B, hops={hops}, packets={num_packets}, startup={startup_latency} cycles, serialization={serialization_latency} cycles")
         return int(startup_latency + serialization_latency)
     
     def simulate_ring_communication_estimate(
@@ -879,6 +928,7 @@ class Matmul(Operator):
         
         # 如果是第一批(对角线),所有core都用本地数据,无需NoC通信
         if batch_id == 0:
+            self._weight_location_map = {} # 重置位置映射
             return 0
         
         # 计算 mesh 维度（采取近似方阵）
@@ -892,10 +942,9 @@ class Matmul(Operator):
         for (m_idx, n_idx, k_idx) in batch:
             tile = hbm_tiles[m_idx, n_idx, k_idx]
             
-            # 对角线调度: B矩阵从 n_idx channel 传到 m_idx channel
-            src_channel = n_idx % channel_count
-            dst_channel = m_idx % channel_count
-            
+            # 对角线调度: 权重矩阵从实际所在 channel 传到输入矩阵所在channel
+            src_channel = self._get_weight_channel_location(n_idx, k_idx, channel_count)
+            dst_channel = self._get_input_channel_location(m_idx, k_idx, channel_count)
             # 如果是本地数据，跳过
             if src_channel == dst_channel:
                 continue
@@ -910,11 +959,72 @@ class Matmul(Operator):
                 pcb_module, clock_freq
             )
             comm_times.append(time_cycles)
+            self._update_data_location(m_idx, n_idx, k_idx, dst_channel, is_weight=True) # 更新channel映射中权重矩阵（通过is_weight确定）数据到dst_channel位置
         
         # 返回所有通信中的最大延迟（瓶颈）
         return max(comm_times) if comm_times else 0
     
+    ''' 权重和输入数据块的物理位置跟踪相关函数 '''
+    def _init_location_mapping_if_needed(self) -> None:
+        """加载初始化权重位置映射字典"""
+        if not hasattr(self, '_weight_location_map'):
+            self._weight_location_map: Dict[Tuple[int, int], int] = {}
+            print("Initialized weight location mapping dictionary.")
+
+
+    def _get_weight_channel_location(self, n_idx: int, k_idx: int, channel_count: int) -> int:
+        """
+        获取权重块 (n_idx, k_idx) 当前实际所在的物理 channel。
+        首次调用时初始化为其逻辑 channel (n_idx % channel_count)。
+        """
+        self._init_location_mapping_if_needed()
+        
+        key = (n_idx, k_idx)
+        
+        # 如果尚未记录，初始化为其逻辑 channel
+        if key not in self._weight_location_map:
+            self._weight_location_map[key] = n_idx % channel_count
+        
+        return self._weight_location_map[key]
+
+
+    def _get_input_channel_location(self, m_idx: int, k_idx: int, channel_count: int) -> int:
+        """
+        获取输入块 (m_idx, k_idx) 当前实际所在的物理 channel。
+        首次调用时初始化为其逻辑 channel (m_idx % channel_count)。
+        """
+        self._init_location_mapping_if_needed()
+        
+        # 输入块使用负索引以区分权重块
+        key = (-m_idx - 1, k_idx)  # 用负数避免与权重块键冲突
+        
+        if key not in self._weight_location_map:
+            self._weight_location_map[key] = m_idx % channel_count
+        
+        return self._weight_location_map[key]
+
+
+    def _update_data_location(self, m_idx: int, n_idx: int, k_idx: int, new_channel: int, is_weight: bool = True) -> None:
+        """
+        更新数据块移位后的新物理位置。
+        Args:
+            m_idx: 输入矩阵的行块索引（用于输入块）
+            n_idx: 权重矩阵的列块索引（用于权重块）
+            k_idx: K 维度块索引
+            new_channel: 移位后的目标 channel 号
+            is_weight: True 表示更新权重块 (n_idx, k_idx)，False 表示更新输入块 (m_idx, k_idx)
+        """
+        self._init_location_mapping_if_needed()
+        
+        if is_weight:
+            key = (n_idx, k_idx)
+        else:
+            key = (-m_idx - 1, k_idx)  # 输入块用负索引
     
+        self._weight_location_map[key] = new_channel
+
+
+    """从此处往下有关booksim的函数（到HBMtileSimulator为止）全部为未经验证的新增代码，为确保结构完整性暂时保留，可以视为没用"""
     @staticmethod
     def _bytes_to_flits(data_bytes: int, flit_size_bits: int = 128) -> int:
         """将字节数转换为 flit 数量"""
@@ -987,7 +1097,7 @@ class Matmul(Operator):
                 # 3) 时间戳策略：默认保持 batch_start_cycle，不在批内累加
                 # 如需按批次串行，可在调用处传入累加后的 batch_start_cycle
     
-    """从此处往下有关booksim的函数（到HBMtileSimulator为止）全部为未经验证的新增代码，为确保结构完整性暂时保留，可以视为没用"""
+
     def generate_booksim_config(
         self,
         pcb_module: Device,
@@ -1330,7 +1440,6 @@ class Matmul(Operator):
             total_cycle_count = 0
             
             # 根据每个 channel 的 core 数量决定并行度，开始运算此HBMtile的计算时间+读取时间
-            print("cores_per_channel: ", cores_per_channel)
             if cores_per_channel == 1:
                 # *单核模式：完全串行，保留数据重用
                 # 读取第一个 core tile 的数据
