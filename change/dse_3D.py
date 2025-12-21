@@ -81,7 +81,6 @@ def template_to_system(arch_specs):
     # noc module
     noc_module = NOCModule(
         io_specs["noc_bandwidth_byte_per_second"],
-        io_specs["noc_first_packet_latency_second"],
         io_specs["noc_hop_latency_second"],
     )
 

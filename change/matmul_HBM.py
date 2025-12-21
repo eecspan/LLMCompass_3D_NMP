@@ -800,60 +800,51 @@ class Matmul(Operator):
     
     
     def _get_channel_coords(self, channel_id: int, mesh_dim_x: int) -> tuple:
-        """计算 channel 在 2D mesh 中的坐标（首尾相连蛇形映射）
+        """
+        计算 channel 在 2D mesh 中的坐标，构建一个物理相邻的哈密顿环。
         
-        设计逻辑：
-        1. 第一列(col=0)特殊处理：
-        - (0,0) = 0
-        - (1,0) = n-1 (总节点数-1)
-        - (2,0) = n-2
-        - 依次递减
+        策略：
+        1. ID=0 放在 (0,0)
+        2. ID=1 到 ID=N-R (其中R是行数) 在右侧子网格 (Col >= 1) 进行蛇形游走
+        3. 剩下的高位 ID (N-R+1 到 N-1) 填充在第一列 (Col=0)，从下往上接回 (0,0)
         
-        2. 剩余部分(col>=1)使用普通蛇形拓扑：
-        - 从1开始编号
-        - 偶数行从左到右
-        - 奇数行从右到左
-        
-        4x4示例：
-        Row 0: 0  1  2  3
-        Row 1: 15 6  5  4
-        Row 2: 14 7  8  9
-        Row 3: 13 12 11 10
+        要求：mesh_dim_x 必须为偶数，以保证蛇形游走的出口能接上第一列的入口。
         """
         if mesh_dim_x % 2 != 0:
-            raise ValueError(f"mesh_dim_x 必须为偶数，当前为 {mesh_dim_x}")
-        
+            raise ValueError(f"Mesh dimension must be even for this ring topology, got {mesh_dim_x}")
+            
         total_nodes = mesh_dim_x * mesh_dim_x
         
-        # 构建坐标到channel_id的映射
-        coord_to_id = {}
+        # --- Case 1: 起点 ---
+        if channel_id == 0:
+            return (0, 0)
+            
+        # --- Case 2: 回路 (第一列, Col=0) ---
+        # 对应原逻辑中: coord_to_id[(row, 0)] = total_nodes - row
+        # 也就是 ID > Total - Height 的那些点
+        if channel_id > total_nodes - mesh_dim_x:
+            # 这些点位于第一列，且 ID 越大越靠近 (0,0)
+            # 例如 4x4 Mesh: ID 15->(1,0), 14->(2,0), 13->(3,0)
+            row = total_nodes - channel_id
+            return (row, 0)
+            
+        # --- Case 3: 蛇形主体 (Col >= 1) ---
+        # 剩下的点在右侧 [Dim]x[Dim-1] 的区域内蛇形排列
+        # 将 ID 减 1 映射到从 0 开始的线性空间
+        effective_id = channel_id - 1
+        sub_grid_width = mesh_dim_x - 1
         
-        # 1. 填充第一列(col=0)
-        coord_to_id[(0, 0)] = 0
-        for row in range(1, mesh_dim_x):
-            coord_to_id[(row, 0)] = total_nodes - row
+        row = effective_id // sub_grid_width
+        col_offset = effective_id % sub_grid_width
         
-        # 2. 填充剩余部分(col>=1)，使用普通蛇形拓扑
-        # 从1开始编号
-        current_id = 1
-        for row in range(mesh_dim_x):
-            if row % 2 == 0:
-                # 偶数行：从左到右
-                for col in range(1, mesh_dim_x):
-                    coord_to_id[(row, col)] = current_id
-                    current_id += 1
-            else:
-                # 奇数行：从右到左
-                for col in range(mesh_dim_x - 1, 0, -1):
-                    coord_to_id[(row, col)] = current_id
-                    current_id += 1
-        
-        # 查找对应的坐标
-        for coord, cid in coord_to_id.items():
-            if cid == channel_id:
-                return coord
-        raise ValueError(f"Invalid channel_id {channel_id} for {mesh_dim_x}x{mesh_dim_x} mesh")
-        
+        # 偶数行从左往右 (Col 1 -> End)
+        # 奇数行从右往左 (Col End -> 1)
+        if row % 2 == 0:
+            col = 1 + col_offset
+        else:
+            col = sub_grid_width - col_offset # 即 mesh_dim_x - 1 - col_offset
+            
+        return (row, col)        
 
     
     def _get_channel_manhattan_distance(self, src_channel: int, dst_channel: int, mesh_dim_x: int) -> int:
@@ -871,27 +862,37 @@ class Matmul(Operator):
         pcb_module: Device,
         clock_freq: float
     ) -> int:
-        """计算点对点通信延迟，参考 draw_tp.py 的模型
-        
-        延迟模型: T = (hops * Lf) + (packets - 1) * Lh
+        """
+        计算点对点通信延迟 (周期数)
+        基于虫洞路由: Time = (Hops * Hop_Latency) + (Size / Bandwidth)
         """
         if size_bytes <= 0:
             return 0
         
-        # 计算跳数
+        # 0. 获取频率 (如果参数没传，尝试从 compute_module 获取)
+        if clock_freq is None:
+            clock_freq = pcb_module.compute_module.clock_freq
+
+        # 1. 计算跳数 (Hops)
         hops = self._get_channel_manhattan_distance(src_channel, dst_channel, mesh_dim_x)
         
-        # 计算包数
-        num_packets = ceil(size_bytes / (pcb_module.noc_module.bandwidth * pcb_module.noc_module.hop_latency))
+        hop_latency_sec = pcb_module.noc_module.hop_latency
+        bandwidth_bps = pcb_module.noc_module.bandwidth
         
-        # 计算延迟
-        if num_packets <= 1:
-            return int(hops * pcb_module.noc_module.first_packet_latency * clock_freq)
+        # 3. 计算物理时间 (秒)
+        # Head Latency: 头微片走过路径的时间
+        head_latency_sec = hops * hop_latency_sec
         
-        startup_latency = hops * pcb_module.noc_module.first_packet_latency * clock_freq
-        serialization_latency = (num_packets - 1) * pcb_module.noc_module.hop_latency * clock_freq
-        return int(startup_latency + serialization_latency)
+        # Serialization Latency: 数据串行通过带宽瓶颈的时间
+        serialization_sec = size_bytes / bandwidth_bps
+        
+        # 4. 转换为周期数 = 时间 * 频率
+        total_latency_sec = head_latency_sec + serialization_sec
+        total_latency_cycles = ceil(total_latency_sec * clock_freq)
+        
+        return int(total_latency_cycles)
     
+
     def simulate_ring_communication_estimate(
         self,
         batch: List[Tuple[int, int, int]],

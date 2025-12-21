@@ -1,8 +1,7 @@
 {
     "name": "3D Stack TEST",
     "device_count": 4,
-    "interconnect": {  
-        "TODO":"可能需要添加NoC的相关配置参数",
+    "interconnect": {
         "link": {
             "name": "NVLink3",
             "bandwidth_per_direction_byte": 25e9,
@@ -73,9 +72,8 @@
             "_commet_bandwidth_of_HBM <-> core":"假设每个channel带宽为40GB/s",
 
             "noc_bandwidth_byte_per_second": 40e9,
-            "noc_first_packet_latency_second": 25e-9,
             "noc_hop_latency_second": 1e-9,
-            "_commet_noc": "NoC参数: 带宽40GB/s, 首包延迟25ns, 每跳延迟1ns (2D mesh结构), 用于core间数据传输",
+            "_commet_noc": "NoC参数: 带宽40GB/s, 每跳延迟1ns",
 
             "pin_count_per_channel": 1024,
             "bandwidth_per_pin_bit": 3.2e9,
