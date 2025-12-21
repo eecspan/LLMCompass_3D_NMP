@@ -6,7 +6,7 @@ dependencies:
   - python=3.9
   - pytorch
   - pip:
-    - scalesim
+    - scalesim==2.0.2
     - matplotlib
     - seaborn
     - scipy
