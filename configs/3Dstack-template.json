@@ -75,6 +75,18 @@
             "noc_hop_latency_second": 1e-9,
             "_commet_noc": "NoC参数: 带宽40GB/s, 每跳延迟1ns",
 
+            "noc_booksim_path": "/home/panyudong/work/3d-monitor/booksim2/src/booksim",
+            "noc_booksim_base_cfg": "/home/panyudong/work/3d-monitor/booksim2/runfiles/meshconfig",
+            "noc_tmp_dir": "/home/panyudong/work/3d-monitor/LLMCompass_3D_stack/.tmp_booksim",
+            "noc_trace_keep": false,
+            "noc_flit_bytes": "auto",
+            "noc_packet_policy": "auto",
+            "noc_auto_max_flits": 4096,
+            "noc_topology": "mesh",
+            "noc_routing_function": "dor",
+            "noc_warmup_periods": 0,
+            "noc_max_samples": -1,
+
             "pin_count_per_channel": 1024,
             "bandwidth_per_pin_bit": 3.2e9,
             "_commet_of_pin":"暂时不清楚pin部分是否需要做修改，先行保留"

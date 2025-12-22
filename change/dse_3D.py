@@ -79,9 +79,28 @@ def template_to_system(arch_specs):
     )
 
     # noc module
+    booksim_cfg = None
+    if "noc_booksim_path" in io_specs and "noc_booksim_base_cfg" in io_specs:
+        booksim_cfg = {
+            "path": io_specs["noc_booksim_path"],
+            "base_cfg": io_specs["noc_booksim_base_cfg"],
+            "tmp_dir": io_specs.get("noc_tmp_dir", None),
+            "keep_trace": io_specs.get("noc_trace_keep", False),
+            "flit_bytes": io_specs.get("noc_flit_bytes", "auto"),
+            "packet_policy": io_specs.get("noc_packet_policy", "auto"),
+            "auto_max_flits": io_specs.get("noc_auto_max_flits", 4096),
+            "routing_function": io_specs.get("noc_routing_function", "dor"),
+            "topology": io_specs.get("noc_topology", "mesh"),
+            "warmup_periods": io_specs.get("noc_warmup_periods", 0),
+            "max_samples": io_specs.get("noc_max_samples", -1),
+        }
+
     noc_module = NOCModule(
         io_specs["noc_bandwidth_byte_per_second"],
         io_specs["noc_hop_latency_second"],
+        channel_count=io_specs["memory_channel_active_count"],
+        freq_hz=device_specs["frequency_Hz"],
+        booksim_cfg=booksim_cfg,
     )
 
     # memory module

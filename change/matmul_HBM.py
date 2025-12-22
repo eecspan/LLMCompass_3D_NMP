@@ -746,52 +746,35 @@ class Matmul(Operator):
                 # 3. 批次总时间 = 计算时间 + 通信时间
                 # 通信和计算串行执行
                 batch_cycles = max_compute_cycles + comm_cycles
+                print(f"Batch {batch_idx}: BookSim comm={comm_cycles} cycles, compute={max_compute_cycles} cycles, total={batch_cycles} cycles")
 
                 
                 total_cycle_count += batch_cycles
             
             elif noc_model == "booksim":
-                # *BookSim 精确模拟
-                # 为每个批次生成独立的 trace 和配置文件
-                
-                # 创建临时文件
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    trace_file = os.path.join(tmpdir, f"noc_trace_batch_{batch_idx}.txt")
-                    config_file = os.path.join(tmpdir, f"booksim_config_batch_{batch_idx}.txt")
-                    
-                    # 生成 trace
-                    self.generate_batch_trace_for_booksim(
-                        batch=batch,
-                        hbm_tiles=hbm_tiles,
-                        stacked_mapping=stacked_mapping,
-                        pcb_module=pcb_module,
-                        trace_file=trace_file,
-                    )
-                    
-                    # 生成配置文件
-                    self.generate_booksim_config(
-                        pcb_module=pcb_module,
-                        trace_file=trace_file,
-                        config_file=config_file,
-                        output_dir=tmpdir,
-                    )
-                    
-                    # 运行 BookSim
-                    metrics = self.run_booksim_and_parse(config_file)
-                    
-                    # 检查是否需要回退
-                    if metrics.get('fallback', False):
-                        print(f"Batch {batch_idx}: BookSim unavailable, skipping NoC penalty")
-                        batch_cycles = 0
-                    else:
-                        # 使用 BookSim 结果
-                        batch_cycles = metrics['max_completion_cycle']
-                        print(f"Batch {batch_idx}: BookSim max_latency={batch_cycles} cycles, "
-                              f"avg_latency={metrics['avg_latency']:.1f}, "
-                              f"avg_hops={metrics['avg_hops']:.1f}, "
-                              f"packets={metrics['total_packets']}")
-                    
-                    total_cycle_count += batch_cycles
+                # 1) 批次内最大计算时间
+                max_compute_cycles = 0
+                for (m_idx, n_idx, k_idx) in batch:
+                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                        continue
+                    tile = hbm_tiles[m_idx, n_idx, k_idx]
+                    max_compute_cycles = max(max_compute_cycles, tile.compute_cycle_count)
+
+                # 2) 生成通信请求（src/dst/bytes），交给 NOCModule(BookSim) 求 makespan cycles
+                traffic = self.generate_ring_traffic_requests(
+                    batch=batch,
+                    hbm_tiles=hbm_tiles,
+                    pcb_module=pcb_module,
+                    batch_id=batch_idx,
+                )
+
+                comm_cycles = pcb_module.noc_module.get_latency(traffic, model="booksim") if traffic else 0
+
+                # 3) 串行：通信 + 计算
+                batch_cycles = max_compute_cycles + comm_cycles
+
+                print(f"Batch {batch_idx}: BookSim comm={comm_cycles} cycles, compute={max_compute_cycles} cycles, total={batch_cycles} cycles")
+                total_cycle_count += batch_cycles
             
             else:
                 raise ValueError(f"Unknown noc_model: {noc_model}. Use 'none', 'estimate', or 'booksim'.")
@@ -891,6 +874,44 @@ class Matmul(Operator):
         total_latency_cycles = ceil(total_latency_sec * clock_freq)
         
         return int(total_latency_cycles)
+
+    
+    def generate_ring_traffic_requests(
+        self,
+        batch: List[Tuple[int, int, int]],
+        hbm_tiles: np.ndarray,
+        pcb_module: Device,
+        batch_id: int = 0,
+    ) -> List[Tuple[int, int, int]]:
+        """
+        生成本批次的 NoC 通信请求列表：
+        返回 [(src_channel, dst_channel, size_bytes), ...]，单位为 bytes。
+        同时维护权重块位置映射（与 estimate 模式一致）。
+        """
+        channel_count = pcb_module.memory_module.channel_count
+
+        if batch_id == 0:
+            self._weight_location_map = {}
+            return []
+
+        reqs: List[Tuple[int, int, int]] = []
+        for (m_idx, n_idx, k_idx) in batch:
+            if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                continue
+            tile = hbm_tiles[m_idx, n_idx, k_idx]
+
+            src_channel = self._get_weight_channel_location(n_idx, k_idx, channel_count)
+            dst_channel = self._get_input_channel_location(m_idx, k_idx, channel_count)
+            if src_channel == dst_channel:
+                continue
+
+            size_bytes = tile.K * tile.N * self.data_type.word_size
+            reqs.append((src_channel, dst_channel, int(size_bytes)))
+
+            # 更新权重块的位置（模拟“weight 在 ring 上移动”）
+            self._update_data_location(m_idx, n_idx, k_idx, dst_channel, is_weight=True)
+
+        return reqs
     
 
     def simulate_ring_communication_estimate(
