@@ -1,0 +1,12 @@
+{
+    "name": "qwen3-8b",
+    "model_type": "qwen3",
+    "hidden_size": 4096,
+    "num_attention_heads": 32,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 8,
+    "intermediate_size": 12288,
+    "vocab_size": 151936,
+    "data_type": "fp16",
+    "device_count": 4
+  }
