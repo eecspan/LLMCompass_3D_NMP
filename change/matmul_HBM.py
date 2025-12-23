@@ -57,12 +57,12 @@ class BatchedMatmul(Operator):
     #     self.latency = matmul_latency * self.bs  # + pcb_module.io_module.latency * 2
     #     return self.latency
 
-    def compile_and_simulate(self, pcb_module: Device, compile_mode: str, noc_model: str = "none"):
+    def compile_and_simulate(self, pcb_module: Device, compile_mode: str):
         # 策略1：将批量矩阵乘法分解为多个独立的矩阵乘法
         matmul = Matmul(self.data_type)
         _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
         matmul_latency1 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode, noc_model=noc_model) * self.bs
+            matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
         )
         
         print(f"#1 Matmul latency per batch: {matmul_latency1/self.bs*1e3:.4f} ms, Total latency for {self.bs} batches: {matmul_latency1*1e3:.4f} ms")
@@ -74,7 +74,7 @@ class BatchedMatmul(Operator):
         )
         # todo:latency2的后半部分的数据读取的延迟需要修改为HBM架构
         matmul_latency2 = (
-            matmul.compile_and_simulate(pcb_module, compile_mode, noc_model=noc_model)
+            matmul.compile_and_simulate(pcb_module, compile_mode)
             + (self.bs - 1)
             * self.M
             * self.N
@@ -372,8 +372,7 @@ class Matmul(Operator):
     def compile_and_simulate(  #核心功能是遍历生成mapping
         self,
         pcb_module: Device,
-        compile_mode: str = "3D_stacked",
-        noc_model: str = "none",
+        compile_mode: str = "3D_stacked"
     ):
         print(f"\n{'='*70}")
         print(f"Starting compile_and_simulate - Mode: {compile_mode}")
@@ -498,7 +497,6 @@ class Matmul(Operator):
                                     self.computational_graph,
                                     stacked_mapping,
                                     pcb_module,
-                                    noc_model=noc_model,
                                 )
                                 if cycle_count < min_cycle_count:
                                     min_cycle_count = cycle_count
@@ -534,17 +532,14 @@ class Matmul(Operator):
         computational_graph:ComputationalGraph,
         stacked_mapping:Stacked_Mapping,
         pcb_module:Device,
-        noc_model:str = "none",  # NoC模拟模式: "none","estimate", "booksim"
     ) -> int:
         """
         根据mapping进行任务分割并模拟执行
-        
-        Args:
-            noc_model: NoC模拟模型选择
-                - "none": 不考虑NoC拥塞，取批次内最大执行时间
-                - "estimate": 使用简单估算模型考虑NoC拥塞
-                - "booksim": 使用BookSim进行精确NoC模拟
         """
+        noc_mode = getattr(pcb_module.noc_module, "model", None)
+        if noc_mode not in ("estimate", "booksim"):
+            raise ValueError(f"Invalid noc_mode={noc_mode}. Only 'estimate' or 'booksim' are supported (set in config).")
+
         if self.look_up_table is None:
             self.look_up_table = pd.read_csv(
                 f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
@@ -716,68 +711,30 @@ class Matmul(Operator):
             if not batch:
                 continue
             
-            # NoC模拟：根据选择的模型计算批次执行时间
-            if noc_model == "none":
-                # 原方案：不考虑NoC拥塞，仅取批次内最大执行时间
-                batch_cycles = 0
-                for (m_idx, n_idx, k_idx) in batch:
-                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
-                        continue
-                    tile = hbm_tiles[m_idx, n_idx, k_idx]
-                    batch_cycles = max(batch_cycles, tile.compute_cycle_count)
-                total_cycle_count += batch_cycles
+            # 1) 计算批次内最大计算时间（HBM tile 并行，取最大）
+            max_compute_cycles = 0
+            for (m_idx, n_idx, k_idx) in batch:
+                if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
+                    continue
+                tile = hbm_tiles[m_idx, n_idx, k_idx]
+                max_compute_cycles = max(max_compute_cycles, tile.compute_cycle_count)
             
-            elif noc_model == "estimate":
-                # 简化环形通信估算：适用于对角线调度
-                # 1. 计算批次内最大计算时间(所有HBM tile并行执行)
-                max_compute_cycles = 0
-                for (m_idx, n_idx, k_idx) in batch:
-                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
-                        continue
-                    tile = hbm_tiles[m_idx, n_idx, k_idx]
-                    max_compute_cycles = max(max_compute_cycles, tile.compute_cycle_count)
-                
-                
-                # 2. 计算NoC通信时间(环形传输,取最大链路)
-                comm_cycles = self.simulate_ring_communication_estimate(
-                    batch, hbm_tiles, pcb_module, batch_id=batch_idx
-                )
+            # 2) 生成通信请求（本轮可能为空，比如 batch_id==0）
+            traffic = self.generate_ring_traffic_requests(
+                batch=batch,
+                hbm_tiles=hbm_tiles,
+                pcb_module=pcb_module,
+                batch_id=batch_idx,
+            )
+            # 3) NoC comm cycles
+            comm_cycles = pcb_module.noc_module.get_latency(traffic) if traffic else 0
 
-                # 3. 批次总时间 = 计算时间 + 通信时间
-                # 通信和计算串行执行
-                batch_cycles = max_compute_cycles + comm_cycles
-                print(f"Batch {batch_idx}: BookSim comm={comm_cycles} cycles, compute={max_compute_cycles} cycles, total={batch_cycles} cycles")
-
-                
-                total_cycle_count += batch_cycles
-            
-            elif noc_model == "booksim":
-                # 1) 批次内最大计算时间
-                max_compute_cycles = 0
-                for (m_idx, n_idx, k_idx) in batch:
-                    if m_idx >= hbm_tiles.shape[0] or n_idx >= hbm_tiles.shape[1] or k_idx >= hbm_tiles.shape[2]:
-                        continue
-                    tile = hbm_tiles[m_idx, n_idx, k_idx]
-                    max_compute_cycles = max(max_compute_cycles, tile.compute_cycle_count)
-
-                # 2) 生成通信请求（src/dst/bytes），交给 NOCModule(BookSim) 求 makespan cycles
-                traffic = self.generate_ring_traffic_requests(
-                    batch=batch,
-                    hbm_tiles=hbm_tiles,
-                    pcb_module=pcb_module,
-                    batch_id=batch_idx,
-                )
-
-                comm_cycles = pcb_module.noc_module.get_latency(traffic, model="booksim") if traffic else 0
-
-                # 3) 串行：通信 + 计算
-                batch_cycles = max_compute_cycles + comm_cycles
-
-                print(f"Batch {batch_idx}: BookSim comm={comm_cycles} cycles, compute={max_compute_cycles} cycles, total={batch_cycles} cycles")
-                total_cycle_count += batch_cycles
-            
-            else:
-                raise ValueError(f"Unknown noc_model: {noc_model}. Use 'none', 'estimate', or 'booksim'.")
+            batch_cycles = max_compute_cycles + comm_cycles
+            print(
+                f"Batch {batch_idx}: NoC({pcb_module.noc_module.model}) comm={comm_cycles} cycles, "
+                f"compute={max_compute_cycles} cycles, total={batch_cycles} cycles"
+            )
+            total_cycle_count += batch_cycles
 
         return total_cycle_count
     

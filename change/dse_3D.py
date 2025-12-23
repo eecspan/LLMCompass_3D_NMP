@@ -79,8 +79,13 @@ def template_to_system(arch_specs):
     )
 
     # noc module
+    noc_model = io_specs["noc_model"]  # 强制存在
+    if noc_model not in ("estimate", "booksim"):
+        raise ValueError(f"noc_model must be 'estimate' or 'booksim', got {noc_model}")
+
+
     booksim_cfg = None
-    if "noc_booksim_path" in io_specs and "noc_booksim_base_cfg" in io_specs:
+    if noc_model == "booksim":
         booksim_cfg = {
             "path": io_specs["noc_booksim_path"],
             "base_cfg": io_specs["noc_booksim_base_cfg"],
@@ -96,10 +101,11 @@ def template_to_system(arch_specs):
         }
 
     noc_module = NOCModule(
-        io_specs["noc_bandwidth_byte_per_second"],
-        io_specs["noc_hop_latency_second"],
+        bandwidth_bps=io_specs["noc_bandwidth_byte_per_second"],
+        hop_latency_s=io_specs["noc_hop_latency_second"],
         channel_count=io_specs["memory_channel_active_count"],
         freq_hz=device_specs["frequency_Hz"],
+        model=noc_model,
         booksim_cfg=booksim_cfg,
     )
 

@@ -1,36 +1,93 @@
 import math
-from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from hardware_model.booksim_interface import BookSimInterface, BookSimConfig, TrafficRequest
+from hardware_model.booksim_interface import BookSimInterface, BookSimConfig
+
+# 统一请求格式（delay 预留：支持 3/4 元组，但当前只允许 delay=0）
+# (src_logical, dst_logical, bytes)
+# (delay, src_logical, dst_logical, bytes)  # delay!=0 => NotImplementedError
+TrafficReqIn = Tuple[int, ...]  # 兼容 3/4 元组
+Flow = Tuple[int, int, int]     # (src_node_id, dst_node_id, bytes_sum)
 
 
+class NoCModel:
+    def comm_cycles(self, flows: List[Flow], noc: "NOCModule") -> int:
+        raise NotImplementedError
+
+
+class NoneNoCModel(NoCModel):
+    def comm_cycles(self, flows: List[Flow], noc: "NOCModule") -> int:
+        return 0
+
+
+class AnalyticalNoCModel(NoCModel):
+    """
+    Wormhole（零负载）估算：每条 flow 的时间 = hops*hop_latency + bytes/bw
+    makespan 取 max(flow_time)
+    """
+    def comm_cycles(self, flows: List[Flow], noc: "NOCModule") -> int:
+        if not flows:
+            return 0
+
+        worst = 0
+        for src, dst, size_b in flows:
+            hops = noc.manhattan_hops(src, dst)
+            t_sec = hops * noc.hop_latency_s + (size_b / noc.bandwidth_bps)
+            cyc = int(math.ceil(t_sec * noc.freq_hz))
+            if cyc > worst:
+                worst = cyc
+        return worst
+
+
+class BookSimNoCModel(NoCModel):
+    """
+    BookSim 精确模拟（含运行内缓存A/LUT）
+    key = tuple(sorted((src,dst,bytes_sum))) after mapping+aggregation
+    """
+    def __init__(self, bs: BookSimInterface):
+        self.bs = bs
+        self._lut: Dict[Tuple[Tuple[int, int, int], ...], int] = {}
+
+    def comm_cycles(self, flows: List[Flow], noc: "NOCModule") -> int:
+        if not flows:
+            return 0
+        key = tuple(sorted(flows))
+        hit = self._lut.get(key)
+        if hit is not None:
+            return hit
+
+        cycles = self.bs.simulate(
+            requests=list(key),
+            mesh_k=noc.mesh_k,
+            bw_bps=noc.bandwidth_bps,
+            freq_hz=noc.freq_hz,
+        )
+        self._lut[key] = cycles
+        return cycles
+
+
+@dataclass
 class NOCModule:
-    """
-    统一 NoC 抽象：
-    - 保存物理参数：bandwidth(B/s), hop_latency(s), freq(Hz), channel_count
-    - 保存 BookSim 参数：booksim_path/base_cfg/packet_policy/flit_bytes/...
-    - 提供 get_latency(traffic_requests) -> cycles
-    """
+    bandwidth_bps: float
+    hop_latency_s: float
+    channel_count: int
+    freq_hz: float
+    model: str = "none"
+    booksim_cfg: Optional[Dict[str, Any]] = None
 
-    def __init__(
-        self,
-        bandwidth_bps: float,
-        hop_latency_s: float,
-        channel_count: int,
-        freq_hz: float,
-        booksim_cfg: Optional[Dict[str, Any]] = None,
-    ):
-        self.bandwidth = bandwidth_bps
-        self.hop_latency = hop_latency_s
-        self.channel_count = int(channel_count)
-        self.freq_hz = float(freq_hz)
+    def __post_init__(self):
+        self.channel_count = int(self.channel_count)
+        self.freq_hz = float(self.freq_hz)
+        self.bandwidth_bps = float(self.bandwidth_bps)
+        self.hop_latency_s = float(self.hop_latency_s)
 
-        # mesh 维度（先按正方形）
+        # mesh 维度（按正方形；你当前 channel_count=16 => k=4）
         k = int(round(math.sqrt(self.channel_count)))
         if k * k != self.channel_count:
             raise ValueError(
                 f"[NOCModule] channel_count={self.channel_count} is not a perfect square; "
-                f"current Hamiltonian-ring mesh mapping assumes k*k==channel_count."
+                f"current Hamiltonian-ring mapping assumes k*k==channel_count."
             )
         if k % 2 != 0:
             raise ValueError(
@@ -38,35 +95,37 @@ class NOCModule:
             )
         self.mesh_k = k
 
-        # 统一映射：logical channel id -> booksim node id(row-major)
+        # logical channel id -> booksim node id(row-major)
         self.logical_to_booksim_id = self._build_hamiltonian_ring_row_major_map(self.mesh_k)
 
-        self._booksim: Optional[BookSimInterface] = None
-        self._booksim_cfg: Optional[BookSimConfig] = None
-
-        if booksim_cfg:
-            self._booksim_cfg = BookSimConfig(
-                booksim_path=booksim_cfg["path"],
-                base_cfg_path=booksim_cfg["base_cfg"],
-                tmp_dir=booksim_cfg.get("tmp_dir"),
-                keep_trace=bool(booksim_cfg.get("keep_trace", False)),
-                flit_bytes=booksim_cfg.get("flit_bytes", "auto"),
-                packet_policy=booksim_cfg.get("packet_policy", "auto"),
-                auto_max_flits=int(booksim_cfg.get("auto_max_flits", 4096)),
-                routing_function=booksim_cfg.get("routing_function", "dor"),
-                topology=booksim_cfg.get("topology", "mesh"),
-                warmup_periods=int(booksim_cfg.get("warmup_periods", 0)),
-                max_samples=int(booksim_cfg.get("max_samples", -1)),
+        # 选择模型（像 DRAMModel 一样）
+        m = (self.model or "none").lower()
+        if m == "none":
+            self._impl: NoCModel = NoneNoCModel()
+        elif m == "estimate":
+            self._impl = AnalyticalNoCModel()
+        elif m == "booksim":
+            if not self.booksim_cfg:
+                raise ValueError("[NOCModule] noc_model=booksim but booksim_cfg is missing")
+            bs_cfg = BookSimConfig(
+                booksim_path=self.booksim_cfg["path"],
+                base_cfg_path=self.booksim_cfg["base_cfg"],
+                tmp_dir=self.booksim_cfg.get("tmp_dir"),
+                keep_trace=bool(self.booksim_cfg.get("keep_trace", False)),
+                flit_bytes=self.booksim_cfg.get("flit_bytes", "auto"),
+                packet_policy=self.booksim_cfg.get("packet_policy", "auto"),
+                auto_max_flits=int(self.booksim_cfg.get("auto_max_flits", 4096)),
+                routing_function=self.booksim_cfg.get("routing_function", "dor"),
+                topology=self.booksim_cfg.get("topology", "mesh"),
+                warmup_periods=int(self.booksim_cfg.get("warmup_periods", 0)),
+                max_samples=int(self.booksim_cfg.get("max_samples", -1)),
             )
-            self._booksim = BookSimInterface(self._booksim_cfg)
-        self._lut = {}
+            self._impl = BookSimNoCModel(BookSimInterface(bs_cfg))
+        else:
+            raise ValueError(f"[NOCModule] unknown noc model: {self.model}")
 
     @staticmethod
     def _channel_coords_hamiltonian_ring(channel_id: int, mesh_k: int) -> tuple[int, int]:
-        """
-        与你当前 matmul_HBM.py 的 _get_channel_coords 同构：构建一个哈密顿环，使 (i,i+1) 在物理 mesh 上 1 hop。
-        返回 (row=y, col=x)。
-        """
         total_nodes = mesh_k * mesh_k
         if channel_id < 0 or channel_id >= total_nodes:
             raise ValueError(f"channel_id out of range: {channel_id}, total={total_nodes}")
@@ -74,7 +133,7 @@ class NOCModule:
         if channel_id == 0:
             return (0, 0)
 
-        # 第一列回路：id in (total_nodes-mesh_k+1 ... total_nodes-1)
+        # 第一列回路
         if channel_id > total_nodes - mesh_k:
             row = total_nodes - channel_id
             return (row, 0)
@@ -95,29 +154,15 @@ class NOCModule:
         out = [0] * total
         for logical in range(total):
             y, x = cls._channel_coords_hamiltonian_ring(logical, mesh_k)
-            out[logical] = y * mesh_k + x  # row-major node id
+            out[logical] = y * mesh_k + x
         return out
 
-    def get_latency(self, traffic_requests, model: str = "booksim") -> int:
+    def _normalize_requests(self, traffic_requests: List[TrafficReqIn]) -> List[Tuple[int, int, int]]:
         """
-        traffic_requests 支持两种格式（delay接口预留，但暂不支持非0）：
-        - (src_logical, dst_logical, size_bytes)
-        - (delay_cycles, src_logical, dst_logical, size_bytes)  # 仅允许 delay_cycles==0
-
-        返回 cycles（BookSim makespan）。
+        输出规范化后的 (src_node_id, dst_node_id, bytes)
+        delay 预留：允许传 4 元组，但 delay!=0 直接报错，避免“看起来支持但实际上被忽略”。
         """
-        model = (model or "booksim").lower()
-        if model != "booksim":
-            raise ValueError(f"NOCModule.get_latency currently supports model='booksim' only, got {model}")
-
-        if self._booksim is None:
-            raise RuntimeError("BookSim is not configured. Provide booksim_cfg in NOCModule init.")
-
-        if not traffic_requests:
-            return 0
-
-        # 1) 归一化输入（兼容3/4元组；delay预留但必须为0）
-        norm = []
+        out: List[Tuple[int, int, int]] = []
         for req in traffic_requests:
             if len(req) == 3:
                 src_ch, dst_ch, size_b = req
@@ -125,36 +170,32 @@ class NOCModule:
             elif len(req) == 4:
                 delay, src_ch, dst_ch, size_b = req
                 if int(delay) != 0:
-                    raise NotImplementedError(
-                        "Delay is reserved in the interface, but non-zero delay is not supported yet."
-                    )
+                    raise NotImplementedError("Delay is reserved but non-zero delay is not supported yet.")
             else:
                 raise ValueError(f"Invalid traffic request tuple length={len(req)}: {req}")
 
             src = self.logical_to_booksim_id[int(src_ch)]
             dst = self.logical_to_booksim_id[int(dst_ch)]
-            norm.append((src, dst, int(size_b)))  # 当前版本仅支持 delay=0
+            out.append((src, dst, int(size_b)))
+        return out
 
-        # 2) canonicalize（缓存A key）：合并重复(src,dst)，排序后转 tuple
-        agg = {}
-        for src, dst, size_b in norm:
-            key = (src, dst)
-            agg[key] = agg.get(key, 0) + size_b
+    def _aggregate_flows(self, reqs: List[Tuple[int, int, int]]) -> List[Flow]:
+        agg: Dict[Tuple[int, int], int] = {}
+        for src, dst, b in reqs:
+            agg[(src, dst)] = agg.get((src, dst), 0) + b
+        return [(src, dst, b) for (src, dst), b in agg.items()]
 
-        canon_key = tuple(sorted((src, dst, size_b) for (src, dst), size_b in agg.items()))
+    def manhattan_hops(self, src_node: int, dst_node: int) -> int:
+        y1, x1 = divmod(src_node, self.mesh_k)
+        y2, x2 = divmod(dst_node, self.mesh_k)
+        return abs(y1 - y2) + abs(x1 - x2)
 
-        # 3) LUT 命中直接返回
-        hit = self._lut.get(canon_key)
-        if hit is not None:
-            return hit
-
-        # 4) miss：调用 booksim
-        cycles = self._booksim.simulate(
-            requests=list(canon_key),  # 直接把合并后的 flows 交给 booksim_interface 做拆包
-            mesh_k=self.mesh_k,
-            bw_bps=self.bandwidth,
-            freq_hz=self.freq_hz,
-        )
-
-        self._lut[canon_key] = cycles
-        return cycles
+    def get_latency(self, traffic_requests: List[TrafficReqIn]) -> int:
+        """
+        统一入口：调用方只传 requests，模型由 config 决定。
+        """
+        if not traffic_requests:
+            return 0
+        reqs = self._normalize_requests(traffic_requests)
+        flows = self._aggregate_flows(reqs)
+        return self._impl.comm_cycles(flows, self)

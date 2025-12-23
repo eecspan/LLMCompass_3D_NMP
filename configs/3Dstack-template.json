@@ -73,7 +73,11 @@
 
             "noc_bandwidth_byte_per_second": 40e9,
             "noc_hop_latency_second": 1e-9,
-            "_commet_noc": "NoC参数: 带宽40GB/s, 每跳延迟1ns",
+            "noc_model": "estimate",
+            "_noc_model_list": [
+                "booksim",
+                "estimate"
+            ],
 
             "noc_booksim_path": "/home/panyudong/work/3d-monitor/booksim2/src/booksim",
             "noc_booksim_base_cfg": "/home/panyudong/work/3d-monitor/booksim2/runfiles/meshconfig",
@@ -95,6 +99,10 @@
             "total_capacity_GB": 80,
             "dram": {
                 "model": "ramulator",
+                "_model_list": [
+                    "ramulator",
+                    "bandwidth"
+                ],
                 "bandwidth_per_cycle": 40e9,
                 "ramulator_path": "/home/panyudong/work/3d-monitor/attacc_simulator/ramulator2/ramulator2",
                 "clean_temp": false,

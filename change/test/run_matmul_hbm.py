@@ -22,8 +22,6 @@ def main():
     parser.add_argument("--N", type=int, required=True, help="Matmul N dimension")
     parser.add_argument("--K", type=int, required=True, help="Matmul K dimension")
     parser.add_argument("--mode", choices=["3D_stacked", "heuristic-GPU"], default="3D_stacked", help="Compile mode")
-    parser.add_argument("--noc-model", choices=["none", "booksim","estimate"], default="none", 
-                        help="NoC simulation model: 'none' (no congestion), 'booksim' (precise simulation)")
     args = parser.parse_args()
 
     print(f"[1/4] Loading 3Dstack configuration from configs/3Dstack-template.json...")
@@ -34,7 +32,6 @@ def main():
     print(f"      → Device cores: {system.device.compute_module.core_count}")
     print(f"      → Memory channels: {system.device.memory_module.channel_count}")
     print(f"      → Frequency: {system.device.compute_module.clock_freq / 1e9:.2f} GHz")
-    print(f"      → NoC model: {args.noc_model}")
 
     try:
         print(f"[3/4] Initializing BatchedMatmul operator (bs={args.bs}, M={args.M}, N={args.N}, K={args.K})...")
@@ -47,7 +44,6 @@ def main():
         latency = op.compile_and_simulate(
             system.device,
             compile_mode=args.mode,
-            noc_model=args.noc_model,
         )
         
         print(f"\n{'='*60}")
