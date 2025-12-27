@@ -391,9 +391,16 @@ class Matmul(Operator):
         min_cycle_count = 2**63 - 1
         best_mapping = None
         best_stacked_mapping = None
-        M = self.computational_graph.M
-        N = self.computational_graph.N
-        K = self.computational_graph.K
+        M0 = self.computational_graph.M
+        N0 = self.computational_graph.N
+        K0 = self.computational_graph.K
+
+        # 其实等价于 M0 < N0
+        transpose_gemm = (M0 * K0) < (K0 * N0)
+        M_eff, N_eff = (N0, M0) if transpose_gemm else (M0, N0)
+        # 等价于当输入总量少，就流转输入数据
+        effective_graph = self.ComputationalGraph(M_eff, N_eff, K0, self.data_type)
+
         # if (M == 1 or N == 1) and (
         #     compile_mode == "heuristic-GPU"
         #     or compile_mode == "heuristic-our-throughput"
@@ -413,9 +420,9 @@ class Matmul(Operator):
         #     )  # + pcb_module.io_module.latency * 2
         #     return self.latency
         if compile_mode == "3D_stacked":
-            HBM_tile_M_log2 = ceil(log2(self.computational_graph.M / pcb_module.memory_module.channel_count)) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
-            HBM_tile_N_log2 = ceil(log2(self.computational_graph.N / pcb_module.memory_module.channel_count))
-            HBM_tile_K_log2 = ceil(log2(self.computational_graph.K))#K维度暂时不进行切分
+            HBM_tile_M_log2 = ceil(log2(effective_graph.M / pcb_module.memory_module.channel_count)) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
+            HBM_tile_N_log2 = ceil(log2(effective_graph.N / pcb_module.memory_module.channel_count))
+            HBM_tile_K_log2 = ceil(log2(effective_graph.K))#K维度暂时不进行切分
             HBM_TILE_M = 2 ** HBM_tile_M_log2
             HBM_TILE_N = 2 ** HBM_tile_N_log2
             HBM_TILE_K = 2 ** HBM_tile_K_log2
@@ -494,7 +501,7 @@ class Matmul(Operator):
                                     print(f"    → Core tile: M={core_tile_M}, N={core_tile_N}, K={core_tile_K}, loop={core_loop_order}")
                                 
                                 cycle_count = self.stacked_simulate(
-                                    self.computational_graph,
+                                    effective_graph,
                                     stacked_mapping,
                                     pcb_module,
                                 )
@@ -1422,7 +1429,7 @@ class Matmul(Operator):
         self,
     ):
         # import subprocess
-        # subprocess.run(['nvidia-smi', '-q', '鈥揹', 'CLOCK'])
+        # subprocess.run(['nvidia-smi', '-q', '-d', 'CLOCK'])
         input1 = torch.randn(
             self.computational_graph.M,
             self.computational_graph.K,
