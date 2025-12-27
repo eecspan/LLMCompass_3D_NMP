@@ -16,11 +16,6 @@ class NoCModel:
         raise NotImplementedError
 
 
-class NoneNoCModel(NoCModel):
-    def comm_cycles(self, flows: List[Flow], noc: "NOCModule") -> int:
-        return 0
-
-
 class AnalyticalNoCModel(NoCModel):
     """
     Wormhole（零负载）估算：每条 flow 的时间 = hops*hop_latency + bytes/bw
@@ -73,7 +68,7 @@ class NOCModule:
     hop_latency_s: float
     channel_count: int
     freq_hz: float
-    model: str = "none"
+    model: str = "estimate"
     booksim_cfg: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
@@ -99,10 +94,8 @@ class NOCModule:
         self.logical_to_booksim_id = self._build_hamiltonian_ring_row_major_map(self.mesh_k)
 
         # 选择模型（像 DRAMModel 一样）
-        m = (self.model or "none").lower()
-        if m == "none":
-            self._impl: NoCModel = NoneNoCModel()
-        elif m == "estimate":
+        m = self.model.lower()
+        if m == "estimate":
             self._impl = AnalyticalNoCModel()
         elif m == "booksim":
             if not self.booksim_cfg:

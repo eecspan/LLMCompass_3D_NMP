@@ -9,7 +9,7 @@ class Device:
         compute_module: ComputeModule,
         io_module: IOModule,
         memory_module: MemoryModule,
-        noc_module: NOCModule = NOCModule(0, 0, 0, 0, None),
+        noc_module: NOCModule = NOCModule(0, 0, 0, 0, "estimate"),
     ) -> None:
         self.compute_module = compute_module
         self.io_module = io_module
