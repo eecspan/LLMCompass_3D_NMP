@@ -18,7 +18,7 @@
         "frequency_Hz": 1410e6,
         "compute_chiplet_count": 1,
         "compute_chiplet": {
-            "physical_core_count": 9,  
+            "physical_core_count": 16,  
             "core_count": 16,
             "_commet_core":"需要注意暂时选择channel数和core数保持一致，1core-1channel",
             
@@ -62,10 +62,10 @@
 
             "global_buffer_MB": 0,
             "physical_global_buffer_MB": 0,
-            "global_buffer_bandwidth_per_cycle_byte": 0,
+            "global_buffer_bandwidth_per_cycle_byte": 456,
             "_commet_global_buffer":"令L2缓存不存在来起到直接对接HBM和core的效果",
 
-            "memory_channel_physical_count": 9,
+            "memory_channel_physical_count": 16,
             "memory_channel_active_count": 16,
 
             "bandwidth_per_channel_byte":40e9, 
