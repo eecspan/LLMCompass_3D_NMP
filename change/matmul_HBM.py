@@ -342,6 +342,16 @@ class Matmul(Operator):
             return batches
 
         if schedule == "diagonal-channel":
+            # 特判: 单行或单列场景，直接一次遍历，不做多轮 offset
+            if M_tiles == 1 or N_tiles == 1:
+                for k in range(K_tiles):
+                    flat: List[Tuple[int,int,int]] = []
+                    for m in range(M_tiles):
+                        for n in range(N_tiles):
+                            flat.append((m, n, k))
+                    batches.extend(chunk(flat, channel_count))
+                return batches
+
             # 针对“对角运算”需求；要求 M_tiles 与 N_tiles 至少覆盖 channel_count
             # k 维度顺序执行；每个 k 上进行 B = max(M_tiles, N_tiles) 个批次
             # C = min(M_tiles, N_tiles)
@@ -420,8 +430,8 @@ class Matmul(Operator):
         #     )  # + pcb_module.io_module.latency * 2
         #     return self.latency
         if compile_mode == "3D_stacked":
-            HBM_tile_M_log2 = ceil(log2(effective_graph.M / pcb_module.memory_module.channel_count)) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
-            HBM_tile_N_log2 = ceil(log2(effective_graph.N / pcb_module.memory_module.channel_count))
+            HBM_tile_M_log2 = max(5, ceil(log2(effective_graph.M / pcb_module.memory_module.channel_count))) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
+            HBM_tile_N_log2 = max(5, ceil(log2(effective_graph.N / pcb_module.memory_module.channel_count)))
             HBM_tile_K_log2 = ceil(log2(effective_graph.K))#K维度暂时不进行切分
             HBM_TILE_M = 2 ** HBM_tile_M_log2
             HBM_TILE_N = 2 ** HBM_tile_N_log2
