@@ -139,7 +139,6 @@ class Matmul(Operator):
         self.output_shape = None
         self.look_up_table = None
         self.best_mapping = None
-        self.best_stacked_mapping = None
 
     def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
         # [bs, M, K] * [K, N] = [bs, M, N]
@@ -400,7 +399,6 @@ class Matmul(Operator):
         
         min_cycle_count = 2**63 - 1
         best_mapping = None
-        best_stacked_mapping = None
         M0 = self.computational_graph.M
         N0 = self.computational_graph.N
         K0 = self.computational_graph.K
@@ -432,7 +430,7 @@ class Matmul(Operator):
         if compile_mode == "3D_stacked":
             HBM_tile_M_log2 = max(5, ceil(log2(effective_graph.M / pcb_module.memory_module.channel_count))) #每个HBM tile的M维度大小为按channel等分后+1的二的次方，最后的多余部分采用remain进行单独计算
             HBM_tile_N_log2 = max(5, ceil(log2(effective_graph.N / pcb_module.memory_module.channel_count)))
-            HBM_tile_K_log2 = ceil(log2(effective_graph.K))#K维度暂时不进行切分
+            HBM_tile_K_log2 = max(5, ceil(log2(effective_graph.K))) #K维度暂时不进行切分
             HBM_TILE_M = 2 ** HBM_tile_M_log2
             HBM_TILE_N = 2 ** HBM_tile_N_log2
             HBM_TILE_K = 2 ** HBM_tile_K_log2
@@ -460,7 +458,6 @@ class Matmul(Operator):
             print(f"HBM Double Buffering: {HBM_double_buffering}")
             print(f"\nSearching optimal mapping configurations...")
             
-            total_configs = 0
             tested_configs = 0
             for core_tile_M_log2 in range(5, HBM_tile_M_log2 + 1):
                 core_tile_M = 2**core_tile_M_log2
@@ -517,7 +514,7 @@ class Matmul(Operator):
                                 )
                                 if cycle_count < min_cycle_count:
                                     min_cycle_count = cycle_count
-                                    best_stacked_mapping = stacked_mapping
+                                    best_mapping = stacked_mapping
                                     print(f"  ✓ New best found! Cycle count: {cycle_count}, Latency: {cycle_count / pcb_module.compute_module.clock_freq * 1000:.3f} ms")
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
@@ -527,14 +524,13 @@ class Matmul(Operator):
         print(f"  - Total configurations tested: {tested_configs}")
         print(f"  - Best cycle count: {min_cycle_count}")
         print(f"  - Best latency: {min_cycle_count / pcb_module.compute_module.clock_freq * 1000:.3f} ms")
-        if best_stacked_mapping:
-            print(f"  - Best HBM tile: M={best_stacked_mapping.HBM_tile_M}, N={best_stacked_mapping.HBM_tile_N}, K={best_stacked_mapping.HBM_tile_K}")
-            print(f"  - Best core tile: M={best_stacked_mapping.core_tile_M}, N={best_stacked_mapping.core_tile_N}, K={best_stacked_mapping.core_tile_K}")
-            print(f"  - Loop order: {best_stacked_mapping.core_loop_order}")
+        if best_mapping:
+            print(f"  - Best HBM tile: M={best_mapping.HBM_tile_M}, N={best_mapping.HBM_tile_N}, K={best_mapping.HBM_tile_K}")
+            print(f"  - Best core tile: M={best_mapping.core_tile_M}, N={best_mapping.core_tile_N}, K={best_mapping.core_tile_K}")
+            print(f"  - Loop order: {best_mapping.core_loop_order}")
         print(f"{'='*70}\n")
         
         self.best_mapping = best_mapping
-        self.best_stacked_mapping = best_stacked_mapping
         # if self.best_mapping is not None:
         #     self.best_mapping.display()
         self.best_cycle_count = min_cycle_count
@@ -1257,15 +1253,8 @@ class Matmul(Operator):
             self.M = M
             self.N = N
             self.K = K
-            self.compute_cycle_count = Matmul.simulate_systolic_array_cycle_count(
-                look_up_table,
-                M,
-                N,
-                K,
-                pcb_module.compute_module.core.systolic_array.array_height,
-                pcb_module.compute_module.core.systolic_array.array_width,
-                pcb_module.compute_module.core.systolic_array.mac_per_cycle,
-                Stacked_Mapping.dataflow,
+            self.compute_cycle_count = self.simulate_core_tile_compute_cycle_count(
+                M, N, K, data_type, Stacked_Mapping, pcb_module, look_up_table,
             )
 
         def simulate_core_tile_compute_cycle_count(
